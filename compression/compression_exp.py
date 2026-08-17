@@ -21,6 +21,7 @@ from compression.jpeg_xl import JpegXlCodec
 from compression.npz import NpzCodec
 from compression.exr import EXRCodec
 from compression.png import PNGCodec
+from compression.neural_texture import compress_gaussians, decompress_gaussians
 
 codecs = {
     "jpeg-xl": JpegXlCodec,
@@ -171,6 +172,18 @@ def run_single_compression(gaussians, experiment_out_path, experiment_config):
 
     total_size_bytes = 0
 
+    if experiment_config.get('method') == 'neural-texture':
+        neural_config = dict(experiment_config.get('params', {}))
+        neural_config['attributes'] = experiment_config.get('attributes', [])
+        total_size_bytes = compress_gaussians(gaussians, experiment_out_path, neural_config)
+
+        experiment_config['max_sh_degree'] = gaussians.max_sh_degree
+        experiment_config['active_sh_degree'] = gaussians.active_sh_degree
+        experiment_config['disable_xyz_log_activation'] = gaussians.disable_xyz_log_activation
+        with open(os.path.join(experiment_out_path, "compression_config.yml"), 'w') as stream:
+            yaml.safe_dump(experiment_config, stream, sort_keys=False)
+        return total_size_bytes
+
     for attribute in experiment_config['attributes']:
         compressed_file, min_val, max_mal = compress_attr(attribute, gaussians, experiment_out_path)
         attr_name = attribute['name']
@@ -208,14 +221,20 @@ def run_compressions(gaussians, out_path, compr_exp_config):
     return results
 
 def run_single_decompression(compressed_dir):
-
-    compr_info = pd.read_csv(os.path.join(compressed_dir, "compression_info.csv"), index_col=0)
-
     with open(os.path.join(compressed_dir, "compression_config.yml"), 'r') as stream:
         experiment_config = yaml.safe_load(stream)
 
     decompressed_gaussians = GaussianModel(experiment_config['max_sh_degree'], experiment_config['disable_xyz_log_activation'])
     decompressed_gaussians.active_sh_degree = experiment_config['active_sh_degree']
+
+    if experiment_config.get('method') == 'neural-texture':
+        neural_config = dict(experiment_config.get('params', {}))
+        neural_config['attributes'] = experiment_config.get('attributes', [])
+        for attr_name, decoded_attr in decompress_gaussians(compressed_dir, neural_config).items():
+            decompressed_gaussians.set_attr_from_grid_img(attr_name, decoded_attr)
+        return decompressed_gaussians
+
+    compr_info = pd.read_csv(os.path.join(compressed_dir, "compression_info.csv"), index_col=0)
 
     for attribute in experiment_config['attributes']:
         attr_name = attribute["name"]

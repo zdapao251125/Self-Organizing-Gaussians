@@ -1,7 +1,8 @@
 # Ours Q
 defaults:
   - _self_
-  - compression: umbrella_sh
+  - compression: neural_texture
+
 
 hydra:
   run:

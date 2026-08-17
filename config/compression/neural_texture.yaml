@@ -1,0 +1,23 @@
+experiments:
+  - name: neural_texture_bc1
+    method: neural-texture
+    attributes:
+      - name: _xyz
+      - name: _features_dc
+      - name: _features_rest
+      - name: _scaling
+      - name: _rotation
+      - name: _opacity
+    params:
+      device: cuda
+      hidden_dim: 64
+      latent_resolutions: [1024, 1024, 512, 512]
+      latent_mips: [11, 11, 10, 10]
+      ref_mips: 11
+      phase2_iters: 100000
+      phase3_iters: 1000
+      crop_size: 256
+      num_crops: 1
+      log_every: 200
+      interactive_progress: true
+      decode_chunk_size: 262144
