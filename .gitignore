@@ -6,3 +6,10 @@ diff_rasterization/diff_rast.egg-info
 diff_rasterization/dist
 tensorboard_3d
 screenshots
+
+# Local datasets, experiment outputs, and tracking state
+/tandt/
+/wandb_out/
+/db/
+__pycache__/
+*.egg-info/
