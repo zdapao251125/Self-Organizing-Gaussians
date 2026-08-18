@@ -49,7 +49,10 @@ except Exception:
 BC1_ENDPOINT_BITS = 16
 BC1_INDEX_BITS = 2
 BC1_BLOCK_SIZE_BITS = 64  # 每个4x4块64位
-BC1_INTERP_WEIGHTS = [0.0, 1.0/3.0, 2.0/3.0, 1.0]  # BC1线性插值权重
+# Standard four-colour BC1 palette, expressed as the weight of endpoint 1:
+# index 0 -> ep0, 1 -> ep1, 2 -> 2/3 ep0 + 1/3 ep1,
+# index 3 -> 1/3 ep0 + 2/3 ep1.
+BC1_INTERP_WEIGHTS = [0.0, 1.0, 1.0 / 3.0, 2.0 / 3.0]
 BC1_RGB565_MASK = {
     'R': 0xF800, 'G': 0x07E0, 'B': 0x001F
 }
@@ -62,6 +65,63 @@ BC1_RGB565_SHIFT = {
 # -------------------------------
 
 EPS = 1e-8
+
+GAUSSIAN_CHANNELS = (
+    ("xyz", 0, 3),
+    ("features_dc", 3, 6),
+    ("features_rest", 6, 51),
+    ("scaling", 51, 54),
+    ("rotation", 54, 58),
+    ("opacity", 58, 59),
+)
+
+
+@torch.no_grad()
+def debug_tensor(name: str, value: torch.Tensor) -> None:
+    x = value.detach().float()
+    finite = torch.isfinite(x)
+    if not finite.all():
+        print(f"[debug:{name}] shape={tuple(x.shape)} finite={finite.float().mean().item():.6f} "
+              f"nan={torch.isnan(x).sum().item()} inf={torch.isinf(x).sum().item()}")
+        x = x[finite]
+    if x.numel() == 0:
+        return
+    print(f"[debug:{name}] shape={tuple(value.shape)} min={x.min().item():.6g} "
+          f"max={x.max().item():.6g} mean={x.mean().item():.6g} "
+          f"std={x.std(unbiased=False).item():.6g}")
+
+
+@torch.no_grad()
+def debug_compare(name: str, pred: torch.Tensor, target: torch.Tensor) -> None:
+    p, t = pred.detach().float(), target.detach().float()
+    if p.shape != t.shape:
+        print(f"[debug:{name}] SHAPE MISMATCH pred={tuple(p.shape)} target={tuple(t.shape)}")
+        return
+    valid = torch.isfinite(p) & torch.isfinite(t)
+    if not valid.all():
+        print(f"[debug:{name}] non-finite pairs={(~valid).sum().item()}/{valid.numel()}")
+        p, t = p[valid], t[valid]
+    if p.numel() == 0:
+        return
+    error = p - t
+    mse = error.square().mean()
+    rmse = mse.sqrt()
+    data_range = (t.max() - t.min()).clamp_min(EPS)
+    psnr_range = 20.0 * torch.log10(data_range / rmse.clamp_min(EPS))
+    psnr_unit = -10.0 * torch.log10(mse.clamp_min(EPS))
+    print(f"[debug:{name}] mae={error.abs().mean().item():.6g} "
+          f"rmse={rmse.item():.6g} max_abs={error.abs().max().item():.6g} "
+          f"psnr_unit={psnr_unit.item():.3f}dB psnr_range={psnr_range.item():.3f}dB")
+
+
+@torch.no_grad()
+def debug_gaussian_batch(stage: str, pred: torch.Tensor, target: torch.Tensor) -> None:
+    debug_tensor(f"{stage}/target", target)
+    debug_tensor(f"{stage}/pred", pred)
+    debug_compare(f"{stage}/all", pred, target)
+    for attr, begin, end in GAUSSIAN_CHANNELS:
+        if pred.shape[-1] >= end and target.shape[-1] >= end:
+            debug_compare(f"{stage}/{attr}", pred[:, begin:end], target[:, begin:end])
 
 
 def ste_round(x: torch.Tensor) -> torch.Tensor:
@@ -77,9 +137,11 @@ def rgb_to_rgb565(rgb: torch.Tensor) -> torch.Tensor:
         [*] 整数张量 (0-65535)
     """
     # 量化到对应位数：R(5bit), G(6bit), B(5bit)
-    r = (rgb[..., 0] * 31.0).clamp(0, 31).round().to(torch.int16)
-    g = (rgb[..., 1] * 63.0).clamp(0, 63).round().to(torch.int16)
-    b = (rgb[..., 2] * 31.0).clamp(0, 31).round().to(torch.int16)
+    # int16 is signed: RGB565 values with bit 15 set would become negative and
+    # corrupt subsequent integer packing. Keep the packed value in int32.
+    r = (rgb[..., 0] * 31.0).clamp(0, 31).round().to(torch.int32)
+    g = (rgb[..., 1] * 63.0).clamp(0, 63).round().to(torch.int32)
+    b = (rgb[..., 2] * 31.0).clamp(0, 31).round().to(torch.int32)
 
     # 打包为16bit整数：R<<11 | G<<5 | B
     rgb565 = (r << 11) | (g << 5) | b
@@ -177,22 +239,29 @@ def random_uv_lod(batch: int, max_lod: float, device: torch.device) -> Tuple[tor
 
 
 def generate_crop_batch_correct(ref_base_res, max_lod, num_crops=1, crop_size=512, device="cuda"):
-    # 每个 crop 内生成随机子像素偏移
-    W = crop_size
-    H = crop_size
-    # 关键：每个像素位置加上一个随机偏移（0~1之间的小数）
-    u = (torch.arange(W, device=device) + torch.rand(1, device=device)) / W
-    v = (torch.arange(H, device=device) + torch.rand(1, device=device)) / H
-    u_grid, v_grid = torch.meshgrid(u, v, indexing='ij')
-    uv = torch.stack([u_grid.flatten(), v_grid.flatten()], dim=1)
+    """Generate ``num_crops`` independently jittered crops.
 
-    # LOD 采样保持不变（指数分布）
-    if torch.rand(1).item() < 0.05:
-        lod = torch.rand(1).item() * max_lod
-    else:
-        lod = (torch.rand(1).item() ** 4) * max_lod
-    lod = torch.full((W * H,), lod, device=device)
-    return uv, lod
+    A crop is placed on the reference pixel grid instead of always spanning the
+    complete texture.  UV components are returned in (x, y) order.
+    """
+    side = min(int(crop_size), int(ref_base_res))
+    all_uv, all_lod = [], []
+    yy, xx = torch.meshgrid(
+        torch.arange(side, device=device),
+        torch.arange(side, device=device), indexing="ij"
+    )
+    for _ in range(int(num_crops)):
+        max_origin = max(0, int(ref_base_res) - side)
+        x0 = torch.randint(max_origin + 1, (), device=device) if max_origin else 0
+        y0 = torch.randint(max_origin + 1, (), device=device) if max_origin else 0
+        jitter = torch.rand(2, device=device)
+        u = (xx + x0 + jitter[0]) / float(ref_base_res)
+        v = (yy + y0 + jitter[1]) / float(ref_base_res)
+        all_uv.append(torch.stack((u.reshape(-1), v.reshape(-1)), dim=1))
+        r = torch.rand((), device=device)
+        sampled_lod = (r if torch.rand((), device=device) < 0.05 else r.pow(4)) * max_lod
+        all_lod.append(sampled_lod.expand(side * side))
+    return torch.cat(all_uv, dim=0), torch.cat(all_lod, dim=0)
 
 class BC1SurrogateBlockLevel(nn.Module):
     """
@@ -281,8 +350,13 @@ class BC1SurrogateBlockLevel(nn.Module):
         # 索引：前向量化到 {0,1,2,3}，反向梯度直通
         x_n = torch.sigmoid(self.indices)  # [NB,16] in [0,1]
 
-        x_q = x_n + (ste_round(x_n * 3.0) / 3.0 - x_n).detach()  # 连续值 0, 1/3, 2/3, 1
-        weights = x_q  # 直接作为插值权重
+        index_float = x_n * 3.0
+        index_hard = ste_round(index_float)
+        palette = x_n.new_tensor(BC1_INTERP_WEIGHTS)
+        hard_weights = palette[index_hard.detach().long().clamp(0, 3)]
+        # Use the standard BC1 palette in the forward pass and a straight-through
+        # gradient through the continuous index parameter.
+        weights = x_n + (hard_weights - x_n).detach()
 
         # 3. BC1线性插值计算
         ep0 = e_u[:, 0:1, :]  # [NB,1,3]
@@ -313,6 +387,18 @@ class BC1SurrogateBlockLevel(nn.Module):
             e_q = torch.round(e_n * ((1 << BC1_ENDPOINT_BITS) - 1)).to(torch.int16)
         x_n = torch.sigmoid(self.indices)
         x_q = torch.round(x_n * ((1 << BC1_INDEX_BITS) - 1)).to(torch.uint8)
+        # BC1 uses the four-colour palette only when endpoint0 > endpoint1.
+        # Canonicalise here so the exported params, packed bytes and verification
+        # decoder all have exactly the same semantics.
+        swap = e_q[:, 0] <= e_q[:, 1]
+        if swap.any():
+            e_q = e_q.clone()
+            x_q = x_q.clone()
+            old0 = e_q[swap, 0].clone()
+            e_q[swap, 0] = e_q[swap, 1]
+            e_q[swap, 1] = old0
+            swap_map = torch.tensor([1, 0, 3, 2], dtype=torch.uint8, device=x_q.device)
+            x_q[swap] = swap_map[x_q[swap].long()]
         return {
             "h": self.h,
             "w": self.w,
@@ -326,7 +412,11 @@ class BC1SurrogateBlockLevel(nn.Module):
     def quantize_inplace(self):
         # 端点量化（RGB565）
         e_n = torch.sigmoid(self.endpoints)
-        e_qn = torch.round(e_n * ((1 << BC1_ENDPOINT_BITS) - 1)) / ((1 << BC1_ENDPOINT_BITS) - 1)
+        e_qn = torch.stack((
+            torch.round(e_n[..., 0] * 31.0) / 31.0,
+            torch.round(e_n[..., 1] * 63.0) / 63.0,
+            torch.round(e_n[..., 2] * 31.0) / 31.0,
+        ), dim=-1)
         e_qn = e_qn.clamp(1e-4, 1.0 - 1e-4)
         self.endpoints.copy_(torch.log(e_qn / (1.0 - e_qn)))
 
@@ -502,7 +592,7 @@ class NeuralMaterialCompressionModel(nn.Module):
     def forward_bc(self, uv: torch.Tensor, lod: torch.Tensor) -> torch.Tensor:
         x = self._collect_latents_bc(uv, lod, use_uv_shift=False)
         # 归一化 LOD 到 [0,1]
-        lod_norm = (lod / self.max_lod).unsqueeze(1)  # [B, 1]
+        lod_norm = (lod / max(float(self.max_lod), EPS)).unsqueeze(1)  # [B, 1]
         x = torch.cat([x, lod_norm], dim=1)  # [B, n_latent*3+1]
         out = self.decoder(x)
         # 反标准化（仅在推理时）
@@ -536,8 +626,8 @@ class TrainConfig:
     device: str = "cuda"
     batch_size: int = 4096 
     phase1_iters: int = 5_000
-    phase2_iters: int = 200_000
-    phase3_iters: int = 1_000
+    phase2_iters: int = 50_000
+    phase3_iters: int = 3_000
 
     lr_feat_phase1: float = 5e-2
     lr_mlp_phase1: float = 1e-3
@@ -545,14 +635,24 @@ class TrainConfig:
 
     lr_feat_phase2: float = 1e-2
     lr_mlp_phase2: float = 1e-3
-    gamma_phase2: float = 0.9999
+    gamma_phase2: float = 0.99994
 
     lr_mlp_phase3: float = 5e-4
 
     log_every: int = 200
+    debug_every: int = 2000
     interactive_progress: bool = False
     num_crops: int = 1
     crop_size: int = 256
+    validation_res: int = 256
+    features_rest_weight: float = 3.0
+    scaling_raw_weight: float = 1.0
+    scaling_relative_weight: float = 0.1
+    xyz_raw_weight: float = 0.25
+    rotation_angle_weight: float = 2.0
+
+    #新加
+    lod0_only: bool = True
 
 
 def load_reference_mips(path: Optional[Path], levels: int, out_channels: int, device: torch.device) -> List[torch.Tensor]:
@@ -638,12 +738,12 @@ def pack_quantized_blocks_to_64b(qp: dict) -> bytes:
         ep1 = int(endpoints[i, 1].item())
         idx = indices[i].clone()  # 训练索引
 
-        # ---- 步骤1：强制 ep0 > ep1（避免透明模式） ----
-        # if ep0 <= ep1:
-        #     ep0, ep1 = ep1, ep0
-        #     # 端点交换后，训练索引中的 0 和 3 代表的颜色互换
-        #     swap_map = torch.tensor([1, 0, 3, 2], device=idx.device)
-        #     idx = swap_map[idx]
+        # Force the standard four-colour BC1 mode.  When endpoints are swapped,
+        # remap palette indices so the represented colours stay unchanged.
+        if ep0 <= ep1:
+            ep0, ep1 = ep1, ep0
+            swap_map = torch.tensor([1, 0, 3, 2], device=idx.device)
+            idx = swap_map[idx]
         #
         # # ---- 步骤2：训练索引 → 硬件索引 ----
         # # 映射规则：0→0, 1→2, 2→3, 3→1
@@ -731,9 +831,10 @@ def decode_bc1_params_to_mip(qp: dict) -> torch.Tensor:
     # BC1解码核心：RGB565解包 + 2bit索引插值
     def rgb565_to_rgb(ep):
         # 解包RGB565：r(5bit), g(6bit), b(5bit) → 8bit
-        r = ((ep >> 11) & 0x1F) << 3
-        g = ((ep >> 5) & 0x3F) << 2
-        b = (ep & 0x1F) << 3
+        # Match the normalized endpoint values used by the differentiable path.
+        r = int(round(((ep >> 11) & 0x1F) * 255.0 / 31.0))
+        g = int(round(((ep >> 5) & 0x3F) * 255.0 / 63.0))
+        b = int(round((ep & 0x1F) * 255.0 / 31.0))
         return np.array([r, g, b], dtype=np.uint8)
 
     for by in range(bh):
@@ -989,6 +1090,120 @@ def _save_checkpoint(model, history, phase, iter, export_dir=None):
     # 返回checkpoint路径
     return checkpoint_path
 
+def gaussian_attribute_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    raw_minimum: torch.Tensor,
+    raw_scale: torch.Tensor,
+    channel_balance: torch.Tensor,
+    cfg: TrainConfig,
+) -> torch.Tensor:
+    """Hybrid normalized-domain and render-semantic Gaussian loss."""
+    if pred.shape[-1] != 59 or target.shape[-1] != 59:
+        raise ValueError(
+            "gaussian_attribute_loss expects 59 channels "
+            f"(pred={pred.shape[-1]}, target={target.shape[-1]}). "
+            "Use a metadata-driven channel layout for other SH degrees/attribute sets."
+        )
+    weights = {
+        "xyz": 20.0, "features_dc": 5.0,
+        "features_rest": cfg.features_rest_weight,
+        # Raw-domain terms below carry most scaling/rotation supervision.
+        "scaling": 2.0, "rotation": 1.0, "opacity": 10.0,
+    }
+    loss = sum(
+        weights[name] * F.l1_loss(
+            pred[:, begin:end] * channel_balance[:, begin:end],
+            target[:, begin:end] * channel_balance[:, begin:end],
+        )
+        for name, begin, end in GAUSSIAN_CHANNELS
+    )
+
+    pred_raw = pred * raw_scale + raw_minimum
+    target_raw = target * raw_scale + raw_minimum
+
+    # World-space position supervision with an additional squared tail penalty.
+    xyz_delta = pred_raw[:, 0:3] - target_raw[:, 0:3]
+    xyz_loss = F.smooth_l1_loss(pred_raw[:, 0:3], target_raw[:, 0:3])
+    xyz_tail = xyz_delta.square().mean().sqrt()
+
+    # _scaling is log-scale. Penalize both log error and multiplicative physical
+    # scale ratio, while clamping the exponent for stable gradients.
+    scaling_delta = pred_raw[:, 51:54] - target_raw[:, 51:54]
+    scaling_log_loss = F.smooth_l1_loss(
+        pred_raw[:, 51:54], target_raw[:, 51:54]
+    )
+    scale_ratio = torch.exp(scaling_delta.clamp(-5.0, 5.0))
+    scaling_relative_loss = F.smooth_l1_loss(scale_ratio, torch.ones_like(scale_ratio))
+
+    # q and -q represent the same rotation. Normalize both sides and optimize
+    # their geodesic angular distance rather than component-wise L1 alone.
+    q_pred = F.normalize(pred_raw[:, 54:58], dim=1, eps=EPS)
+    q_target = F.normalize(target_raw[:, 54:58], dim=1, eps=EPS)
+    dot = (q_pred * q_target).sum(dim=1).abs().clamp(0.0, 1.0 - 1e-7)
+    rotation_angle = (2.0 * torch.acos(dot)).mean()
+
+    return (
+        loss
+        + cfg.xyz_raw_weight * (xyz_loss + 0.1 * xyz_tail)
+        + cfg.scaling_raw_weight * scaling_log_loss
+        + cfg.scaling_relative_weight * scaling_relative_loss
+        + cfg.rotation_angle_weight * rotation_angle
+    )
+
+
+@torch.no_grad()
+def debug_error_quantiles(stage: str, pred: torch.Tensor, target: torch.Tensor) -> None:
+    for attr, begin, end in GAUSSIAN_CHANNELS:
+        if pred.shape[1] < end:
+            continue
+        # One error magnitude per sample/Gaussian, so wide attributes do not
+        # dominate merely by having more channels.
+        err = (pred[:, begin:end] - target[:, begin:end]).square().mean(1).sqrt()
+        qs = torch.quantile(err.float(), err.new_tensor([0.50, 0.95, 0.99, 0.999]))
+        print(
+            f"[quantile:{stage}/{attr}] p50={qs[0].item():.6g} "
+            f"p95={qs[1].item():.6g} p99={qs[2].item():.6g} "
+            f"p99.9={qs[3].item():.6g} max={err.max().item():.6g}"
+        )
+
+
+@torch.no_grad()
+def debug_fixed_validation(model, ref_base, raw_minimum, raw_scale, cfg, stage: str) -> None:
+    res = min(int(cfg.validation_res), int(ref_base.shape[-1]))
+    axis = (torch.arange(res, device=ref_base.device).float() + 0.5) / res
+    yy, xx = torch.meshgrid(axis, axis, indexing="ij")
+    uv = torch.stack((xx.reshape(-1), yy.reshape(-1)), dim=1)
+    lod = torch.zeros(uv.shape[0], device=uv.device)
+    target = sample_texture_chw(ref_base, uv, mode="bilinear")
+    pred = model.forward_bc(uv, lod)
+    debug_gaussian_batch(f"{stage}/fixed_global_{res}x{res}", pred, target)
+    debug_error_quantiles(f"{stage}/normalized", pred, target)
+    pred_raw, target_raw = pred * raw_scale + raw_minimum, target * raw_scale + raw_minimum
+    debug_error_quantiles(f"{stage}/raw", pred_raw, target_raw)
+    q_pred = F.normalize(pred_raw[:, 54:58], dim=1, eps=EPS)
+    q_target = F.normalize(target_raw[:, 54:58], dim=1, eps=EPS)
+    angle = 2.0 * torch.acos((q_pred * q_target).sum(1).abs().clamp(0, 1 - 1e-7))
+    aq = torch.quantile(angle * (180.0 / math.pi), angle.new_tensor([.5, .95, .99, .999]))
+    print(f"[rotation-angle:{stage}] p50={aq[0].item():.3f}deg p95={aq[1].item():.3f}deg "
+          f"p99={aq[2].item():.3f}deg p99.9={aq[3].item():.3f}deg "
+          f"max={(angle.max() * 180.0 / math.pi).item():.3f}deg")
+
+
+@torch.no_grad()
+def debug_training_stage(model, uv, lod, target, pred, stage: str) -> None:
+    latents = model._collect_latents_bc(uv, lod, use_uv_shift=False)
+    lod_norm = (lod / max(float(model.max_lod), EPS)).unsqueeze(1)
+    decoder_input = torch.cat((latents, lod_norm), dim=1)
+    decoder_raw = model.decoder(decoder_input)
+    debug_tensor(f"{stage}/uv", uv)
+    debug_tensor(f"{stage}/lod", lod)
+    debug_tensor(f"{stage}/bc1_latent_decode", latents)
+    debug_tensor(f"{stage}/decoder_input", decoder_input)
+    debug_compare(f"{stage}/forward_vs_decoder_raw", pred, decoder_raw)
+    debug_gaussian_batch(f"{stage}/decoder_output", pred, target)
+
+
 def train(model: NeuralMaterialCompressionModel, ref_mips: List[torch.Tensor], cfg: TrainConfig) -> List[dict]:
     device = torch.device(cfg.device)
     max_lod = float(len(ref_mips) - 1)
@@ -1003,6 +1218,37 @@ def train(model: NeuralMaterialCompressionModel, ref_mips: List[torch.Tensor], c
     # Method2
     ref_base = ref_mips[0]  # [C, H, W]
     C = ref_base.shape[0]
+    raw_minimum = torch.as_tensor(
+        getattr(cfg, "channel_minimum", [0.0] * C), device=device, dtype=ref_base.dtype
+    ).view(1, -1)
+    raw_scale = torch.as_tensor(
+        getattr(cfg, "channel_scale", [1.0] * C), device=device, dtype=ref_base.dtype
+    ).view(1, -1)
+    if raw_minimum.shape[1] != C or raw_scale.shape[1] != C:
+        raise ValueError(
+            f"Normalization metadata mismatch: channels={C}, "
+            f"minimum={raw_minimum.shape[1]}, scale={raw_scale.shape[1]}"
+        )
+    debug_tensor("reference/base_normalized", ref_base)
+    for attr, begin, end in GAUSSIAN_CHANNELS:
+        if C >= end:
+            debug_tensor(f"reference/{attr}", ref_base[begin:end])
+
+    # Preserve the material version's useful inverse-std balancing, but normalize
+    # it inside each semantic attribute so it cannot silently change that
+    # attribute's overall configured weight. This balances difficult SH channels
+    # without letting low-variance channels dominate the complete objective.
+    normalized_std = ref_base.std(dim=(1, 2), unbiased=False).clamp_min(1e-4)
+    channel_balance = normalized_std.reciprocal()
+    for attr, begin, end in GAUSSIAN_CHANNELS:
+        group = channel_balance[begin:end]
+        channel_balance[begin:end] = (group / group.mean()).clamp(0.25, 4.0)
+        print(
+            f"[channel-balance:{attr}] min={channel_balance[begin:end].min().item():.4f} "
+            f"max={channel_balance[begin:end].max().item():.4f} "
+            f"mean={channel_balance[begin:end].mean().item():.4f}"
+        )
+    channel_balance = channel_balance.view(1, C)
 
     # --- 1.1 计算原始通道的标准差（用于后续加权损失）---
     raw_std = ref_base.std(dim=(1, 2), keepdim=False) + 1e-8  # [C]
@@ -1027,8 +1273,26 @@ def train(model: NeuralMaterialCompressionModel, ref_mips: List[torch.Tensor], c
     channel_mean.zero_()
     channel_std.fill_(1.0)
     ref_mips_norm = ref_mips
-    channel_weight = 1.0 / raw_std
-    channel_weight = torch.clamp(channel_weight, max=10.0)
+
+    # 原始权重
+    # channel_weight = 1.0 / raw_std
+    # channel_weight = torch.clamp(channel_weight, max=10.0)
+
+    channel_weight = torch.ones(
+    C,
+    device=device,
+    dtype=ref_base.dtype,
+    )
+
+    # SH degree 3、所有属性均启用时的通道布局
+    channel_weight[0:3] = 20.0    # xyz
+    channel_weight[3:6] = 5.0     # features_dc
+    channel_weight[6:51] = 0.5    # features_rest
+    channel_weight[51:54] = 10.0  # scaling
+    channel_weight[54:58] = 5.0   # rotation
+    channel_weight[58:59] = 10.0  # opacity
+
+
     # Tile135D weight
     # Do not apply the original Tiles135D channel-specific weights to Gaussian data.
 
@@ -1058,11 +1322,26 @@ def train(model: NeuralMaterialCompressionModel, ref_mips: List[torch.Tensor], c
         uv, lod = generate_crop_batch_correct(ref_base_res=ref_base_res, max_lod=max_lod, num_crops=cfg.num_crops,
                                               crop_size=cfg.crop_size, device=device)
 
+        #新加
+        if cfg.lod0_only:
+            lod.zero_()
+
         target = sample_mips_trilinear(ref_mips_norm, uv, lod, bilinear_mode="bilinear")
         pred = _fwd_bc(uv, lod)
 
+        if it == 0 or it % max(1, cfg.debug_every) == 0 or it == cfg.phase2_iters - 1:
+            debug_training_stage(model, uv, lod, target, pred, f"phase2/iter_{it}")
+            debug_fixed_validation(
+                model, ref_base, raw_minimum, raw_scale, cfg, f"phase2/iter_{it}"
+            )
+
         # 3. 计算加权损失（替换原有的 loss_l1）
-        loss = F.l1_loss(pred * channel_weight, target * channel_weight)
+        loss = gaussian_attribute_loss(
+            pred, target, raw_minimum, raw_scale, channel_balance, cfg
+        )
+        # 原始加权损失
+        #loss = F.l1_loss(pred * channel_weight, target * channel_weight)
+
         # loss = F.l1_loss(pred, target)
         history.append({"phase": 2, "iter": it, "l1": float(loss.item())})
 
@@ -1095,11 +1374,26 @@ def train(model: NeuralMaterialCompressionModel, ref_mips: List[torch.Tensor], c
         for it in (pbar3 or phase3_iter):
             uv, lod = generate_crop_batch_correct(ref_base_res=ref_base_res, max_lod=max_lod,num_crops=cfg.num_crops, crop_size=cfg.crop_size, device=device)
 
+            #新加
+            if cfg.lod0_only:
+                lod.zero_()
+
             # target = sample_mips_trilinear(ref_mips, uv, lod, bilinear_mode="bilinear")
             target = sample_mips_trilinear(ref_mips_norm, uv, lod, bilinear_mode="bilinear")
             pred = _fwd_bc(uv, lod)
 
-            loss = F.l1_loss(pred * channel_weight, target * channel_weight)
+            if it == 0 or it % max(1, cfg.debug_every) == 0 or it == cfg.phase3_iters - 1:
+                debug_training_stage(model, uv, lod, target, pred, f"phase3_quantized/iter_{it}")
+                debug_fixed_validation(
+                    model, ref_base, raw_minimum, raw_scale, cfg,
+                    f"phase3_quantized/iter_{it}"
+                )
+
+            loss = gaussian_attribute_loss(
+                pred, target, raw_minimum, raw_scale, channel_balance, cfg
+            )
+            # 原始加权损失
+            #loss = F.l1_loss(pred * channel_weight, target * channel_weight)
             history.append({"phase": 3, "iter": it, "l1": float(loss.item())})
 
             opt3.zero_grad(set_to_none=True)
@@ -1130,7 +1424,12 @@ def train_from_tensor(reference: torch.Tensor, export_dir: Path, config=None):
 
     ref_levels = int(config.get("ref_mips", int(math.log2(reference.shape[-1])) + 1))
     ref_mips = build_mip_chain(reference, ref_levels)
-    latent_resolutions = list(config.get("latent_resolutions", [1024, 1024, 512, 512]))
+    # Gaussian attributes contain far more information than the original 9-channel
+    # material input. Use six higher-resolution BC1 latents (18 sampled features)
+    # by default instead of four low-resolution latents (12 features).
+    latent_resolutions = list(config.get(
+        "latent_resolutions", [2048, 2048, 2048, 1024, 1024, 1024]
+    ))
     latent_mips = list(config.get(
         "latent_mips", [int(math.log2(x)) + 1 for x in latent_resolutions]
     ))
@@ -1138,25 +1437,37 @@ def train_from_tensor(reference: torch.Tensor, export_dir: Path, config=None):
         latent_resolutions=latent_resolutions,
         latent_mips=latent_mips,
         out_channels=int(reference.shape[0]),
-        hidden_dim=int(config.get("hidden_dim", 64)),
+        hidden_dim=int(config.get("hidden_dim", 128)),
         ref_base_res=int(reference.shape[-1]),
         max_lod=float(len(ref_mips) - 1),
     ).to(device)
     cfg = TrainConfig(
         device=str(device),
         batch_size=int(config.get("batch_size", 4096)),
-        phase2_iters=int(config.get("phase2_iters", 100000)),
-        phase3_iters=int(config.get("phase3_iters", 1000)),
+        phase2_iters=int(config.get("phase2_iters", 50000)),
+        phase3_iters=int(config.get("phase3_iters", 3000)),
         lr_feat_phase2=float(config.get("lr_feat_phase2", 1e-2)),
         lr_mlp_phase2=float(config.get("lr_mlp_phase2", 1e-3)),
-        gamma_phase2=float(config.get("gamma_phase2", 0.9999)),
+        gamma_phase2=float(config.get("gamma_phase2", 0.99994)),
         lr_mlp_phase3=float(config.get("lr_mlp_phase3", 5e-4)),
         log_every=int(config.get("log_every", 200)),
+        debug_every=int(config.get("debug_every", 2000)),
         interactive_progress=bool(config.get("interactive_progress", False)),
         num_crops=int(config.get("num_crops", 1)),
         crop_size=int(config.get("crop_size", 256)),
+        validation_res=int(config.get("validation_res", 256)),
+        features_rest_weight=float(config.get("features_rest_weight", 3.0)),
+        scaling_raw_weight=float(config.get("scaling_raw_weight", 1.0)),
+        scaling_relative_weight=float(config.get("scaling_relative_weight", 0.1)),
+        xyz_raw_weight=float(config.get("xyz_raw_weight", 0.25)),
+        rotation_angle_weight=float(config.get("rotation_angle_weight", 2.0)),
+
+        #新加
+        lod0_only=bool(config.get("lod0_only", True)),
     )
     cfg.export_dir = Path(export_dir)
+    cfg.channel_minimum = list(config.get("channel_minimum", [0.0] * reference.shape[0]))
+    cfg.channel_scale = list(config.get("channel_scale", [1.0] * reference.shape[0]))
     history = train(model, ref_mips, cfg)
     export_trained_artifacts(model, Path(export_dir))
     return model, history
@@ -1226,7 +1537,7 @@ def main():
 
     if args.export_dir is not None:
         print("\n" + "=" * 60)
-        print("开始导出BC压缩结果...")
+        print("开始导出BC1压缩结果...")
         print("=" * 60)
         try:
             export_trained_artifacts(model=model, out_dir=args.export_dir)
