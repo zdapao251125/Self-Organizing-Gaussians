@@ -1,6 +1,44 @@
+# experiments:
+#   - name: neural_texture_bc1
+#     method: neural-texture
+#     attributes:
+#       - name: _xyz
+#       - name: _features_dc
+#       - name: _features_rest
+#       - name: _scaling
+#       - name: _rotation
+#       - name: _opacity
+#     params:
+#       device: cuda
+#       hidden_dim: 64
+#       latent_resolutions: [1024, 1024, 512, 512]
+#       latent_mips: [11, 11, 10, 10]
+#       phase2_iters: 20000
+#       phase3_iters: 1000
+#       crop_size: 256
+#       num_crops: 1
+#       log_every: 200
+#       interactive_progress: true
+#       decode_chunk_size: 65536
+
+#       #新加
+#       "save_debug_reference": True
+#       "debug_every": 2000
+#       "lod0_only": True
+
+        
+#       "validation_res": 256
+#       "features_rest_weight": 3.0
+#       "scaling_raw_weight": 1.0
+#       "scaling_relative_weight": 0.1
+#       "xyz_raw_weight": 0.25
+#       "rotation_angle_weight": 2.0
+#       "debug_outlier_topk": 10
+
 experiments:
   - name: neural_texture_bc1
     method: neural-texture
+
     attributes:
       - name: _xyz
       - name: _features_dc
@@ -8,16 +46,38 @@ experiments:
       - name: _scaling
       - name: _rotation
       - name: _opacity
+
     params:
       device: cuda
-      hidden_dim: 64
-      latent_resolutions: [1024, 1024, 512, 512]
-      latent_mips: [11, 11, 10, 10]
-      ref_mips: 11
-      phase2_iters: 100000
-      phase3_iters: 1000
+
+      # 模型容量
+      hidden_dim: 128
+      latent_resolutions: [2048, 2048, 2048, 1024, 1024, 1024]
+      latent_mips: [12, 12, 12, 11, 11, 11]
+
+      # 训练配置
+      phase2_iters: 50000
+      phase3_iters: 3000
+      gamma_phase2: 0.99994
+
       crop_size: 256
       num_crops: 1
+      lod0_only: true
+
+      # 日志与验证
       log_every: 200
+      debug_every: 5000
+      validation_res: 256
+      debug_outlier_topk: 10
       interactive_progress: true
-      decode_chunk_size: 262144
+
+      # Gaussian 属性损失
+      features_rest_weight: 3.0
+      scaling_raw_weight: 1.0
+      scaling_relative_weight: 0.1
+      xyz_raw_weight: 0.25
+      rotation_angle_weight: 2.0
+
+      # 解码与调试
+      decode_chunk_size: 65536
+      save_debug_reference: true
