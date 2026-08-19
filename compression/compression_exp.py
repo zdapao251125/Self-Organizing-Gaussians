@@ -172,7 +172,7 @@ def run_single_compression(gaussians, experiment_out_path, experiment_config):
 
     total_size_bytes = 0
 
-    if experiment_config.get('method') == 'neural-texture':
+    if experiment_config.get('method') in {'neural-texture', 'neural-texture-baseline'}:
         neural_config = dict(experiment_config.get('params', {}))
         neural_config['attributes'] = experiment_config.get('attributes', [])
         total_size_bytes = compress_gaussians(gaussians, experiment_out_path, neural_config)
@@ -227,7 +227,7 @@ def run_single_decompression(compressed_dir):
     decompressed_gaussians = GaussianModel(experiment_config['max_sh_degree'], experiment_config['disable_xyz_log_activation'])
     decompressed_gaussians.active_sh_degree = experiment_config['active_sh_degree']
 
-    if experiment_config.get('method') == 'neural-texture':
+    if experiment_config.get('method') in {'neural-texture', 'neural-texture-baseline'}:
         neural_config = dict(experiment_config.get('params', {}))
         neural_config['attributes'] = experiment_config.get('attributes', [])
         for attr_name, decoded_attr in decompress_gaussians(compressed_dir, neural_config).items():

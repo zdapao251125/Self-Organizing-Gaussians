@@ -1,7 +1,7 @@
 # Ours Q
 defaults:
   - _self_
-  - compression: neural_texture
+  - compression: neural_texture_baseline
 
 
 hydra:

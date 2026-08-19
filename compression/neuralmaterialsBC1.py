@@ -82,7 +82,9 @@ def rgb_to_rgb565(rgb: torch.Tensor) -> torch.Tensor:
     b = (rgb[..., 2] * 31.0).clamp(0, 31).round().to(torch.int16)
 
     # 打包为16bit整数：R<<11 | G<<5 | B
-    rgb565 = (r << 11) | (g << 5) | b
+    # Keep the packed value in a signed 32-bit container.  Using int16 here
+    # makes values with bit 15 set negative before they reach the bit packer.
+    rgb565 = (r.to(torch.int32) << 11) | (g.to(torch.int32) << 5) | b.to(torch.int32)
     return rgb565
 
 
@@ -176,7 +178,26 @@ def random_uv_lod(batch: int, max_lod: float, device: torch.device) -> Tuple[tor
     return uv, lod
 
 
-def generate_crop_batch_correct(ref_base_res, max_lod, num_crops=1, crop_size=512, device="cuda"):
+def generate_crop_batch_correct(
+    ref_base_res,
+    max_lod,
+    num_crops=1,
+    crop_size=512,
+    device="cuda",
+    batch_size=None,
+):
+    # The original helper called this a crop batch but always generated a
+    # full crop_size x crop_size grid, ignoring TrainConfig.batch_size.  For
+    # Gaussian attribute grids that makes the advertised baseline impractical
+    # (100k iterations would process billions of samples).  Use the requested
+    # number of random texels when batch_size is provided.
+    if batch_size is not None:
+        uv = torch.rand(int(batch_size), 2, device=device)
+        uniform = torch.rand(int(batch_size), device=device) < 0.05
+        biased = torch.rand(int(batch_size), device=device).pow(4.0) * max_lod
+        lod = torch.where(uniform, torch.rand_like(biased) * max_lod, biased)
+        return uv, lod
+
     # 每个 crop 内生成随机子像素偏移
     W = crop_size
     H = crop_size
@@ -202,11 +223,12 @@ class BC1SurrogateBlockLevel(nn.Module):
 
     def __init__(self, h: int, w: int):
         super().__init__()
-        assert h % 4 == 0 and w % 4 == 0, f"BC1块要求宽高为4的倍数，当前{h}x{w}"
         self.h = h
         self.w = w
-        self.by = h // 4  # 块行数
-        self.bx = w // 4  # 块列数
+        self.padded_h = ((h + 3) // 4) * 4
+        self.padded_w = ((w + 3) // 4) * 4
+        self.by = self.padded_h // 4  # 块行数
+        self.bx = self.padded_w // 4  # 块列数
         self.nb = self.by * self.bx  # 总块数
 
         # BC1参数：每个块2个端点(RGB) + 16个2bit索引
@@ -218,6 +240,14 @@ class BC1SurrogateBlockLevel(nn.Module):
         """从无约束mip初始化BC1块参数（替代BC6的_mode10搜索）"""
         x = mip_chw.detach().clamp_min(0.0)
         device = x.device  # 获取输入张量的设备
+        if x.shape[1:] != (self.h, self.w):
+            x = F.interpolate(
+                x.unsqueeze(0), size=(self.h, self.w), mode="bilinear", align_corners=False
+            ).squeeze(0)
+        pad_right = self.padded_w - self.w
+        pad_bottom = self.padded_h - self.h
+        if pad_right or pad_bottom:
+            x = F.pad(x.unsqueeze(0), (0, pad_right, 0, pad_bottom), mode="replicate").squeeze(0)
         # [3,H,W] → [NB,16,3] 拆分4x4块
         blocks = (
             x.unfold(1, 4, 4)
@@ -298,9 +328,9 @@ class BC1SurrogateBlockLevel(nn.Module):
             blocks.view(self.by, self.bx, 4, 4, 3)
             .permute(4, 0, 2, 1, 3)
             .contiguous()
-            .view(3, self.h, self.w)
+            .view(3, self.padded_h, self.padded_w)
         )
-        return mip
+        return mip[:, : self.h, : self.w]
 
     @torch.no_grad()
     def export_quantized_block_params(self) -> dict:
@@ -324,9 +354,11 @@ class BC1SurrogateBlockLevel(nn.Module):
 
     @torch.no_grad()
     def quantize_inplace(self):
-        # 端点量化（RGB565）
+        # Endpoint quantization must match the actual RGB565 channel widths.
         e_n = torch.sigmoid(self.endpoints)
-        e_qn = torch.round(e_n * ((1 << BC1_ENDPOINT_BITS) - 1)) / ((1 << BC1_ENDPOINT_BITS) - 1)
+        bits = torch.tensor([5.0, 6.0, 5.0], device=e_n.device, dtype=e_n.dtype)
+        levels = (2.0 ** bits) - 1.0
+        e_qn = torch.round(e_n * levels) / levels
         e_qn = e_qn.clamp(1e-4, 1.0 - 1e-4)
         self.endpoints.copy_(torch.log(e_qn / (1.0 - e_qn)))
 
@@ -344,8 +376,7 @@ class BC1SurrogatePyramid(nn.Module):
         self.num_mips = num_mips
         self.mips = nn.ModuleList()
         for i in range(num_mips):
-            sz = max(4, base_res >> i)
-            sz = (sz // 4) * 4  # BC1块对齐
+            sz = max(1, base_res >> i)
             self.mips.append(BC1SurrogateBlockLevel(h=sz, w=sz))
 
     def decode_mips(self) -> List[torch.Tensor]:
@@ -456,8 +487,13 @@ class NeuralMaterialCompressionModel(nn.Module):
             ]
         )
 
+        # The xym baseline uses a fixed 16-value shader input: four RGB
+        # latent samples (12), normalized LOD (1), and three reserved zeros.
+        # Keep the padding for compatibility while still allowing more than
+        # four latent textures in future experiments.
+        self.decoder_input_dim = max(16, self.n_latent * 3 + 1)
         self.decoder = MaterialDecoderMLP(
-            in_dim=self.n_latent * 3 + 1,
+            in_dim=self.decoder_input_dim,
             hidden=hidden_dim,
             out_dim=out_channels,
         )
@@ -504,6 +540,8 @@ class NeuralMaterialCompressionModel(nn.Module):
         # 归一化 LOD 到 [0,1]
         lod_norm = (lod / self.max_lod).unsqueeze(1)  # [B, 1]
         x = torch.cat([x, lod_norm], dim=1)  # [B, n_latent*3+1]
+        if x.shape[1] < self.decoder.fc1.in_features:
+            x = F.pad(x, (0, self.decoder.fc1.in_features - x.shape[1]))
         out = self.decoder(x)
         # 反标准化（仅在推理时）
         if not self.training and hasattr(self, 'channel_mean'):
@@ -553,6 +591,8 @@ class TrainConfig:
     interactive_progress: bool = False
     num_crops: int = 1
     crop_size: int = 256
+    save_debug_artifacts: bool = True
+    channel_weighting: bool = False
 
 
 def load_reference_mips(path: Optional[Path], levels: int, out_channels: int, device: torch.device) -> List[torch.Tensor]:
@@ -628,8 +668,9 @@ def _pack_fields_to_fixed_block(fields: Sequence[Tuple[int, int]], total_bits: i
     return int(acc).to_bytes(total_bytes, byteorder="little", signed=False)
 
 def pack_quantized_blocks_to_64b(qp: dict) -> bytes:
-    endpoints = qp["endpoints_q"].to(torch.int64)  # [NB, 2]
-    indices = qp["indices_q"].to(torch.int64)      # [NB, 16]
+    endpoints, indices = _canonicalize_bc1_params(qp)
+    endpoints = endpoints.to(torch.int64)  # [NB, 2], hardware order
+    indices = indices.to(torch.int64)      # [NB, 16], hardware order
 
     nb = endpoints.shape[0]
     out = bytearray()
@@ -663,6 +704,41 @@ def pack_quantized_blocks_to_64b(qp: dict) -> bytes:
             fields.append((int(x.item()), 2))
         out.extend(_pack_fields_to_fixed_block(fields, total_bits=64))
     return bytes(out)
+
+
+def _canonicalize_bc1_params(qp: dict) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Convert training interpolation indices to standard BC1 block fields.
+
+    The differentiable trainer labels colors by interpolation weights
+    ``[0, 1/3, 2/3, 1]``.  Hardware BC1 uses palette indices
+    ``[endpoint0, endpoint1, 2/3, 1/3]`` when endpoint0 > endpoint1, and
+    switches to a three-color/transparent mode otherwise.  Exporting the
+    training labels verbatim would therefore produce a different texture on
+    a real BC1 sampler than in PyTorch.
+    """
+    endpoints = qp["endpoints_q"].to(torch.int64).clone()
+    indices = qp["indices_q"].to(torch.int64).clone()
+    for i in range(endpoints.shape[0]):
+        ep0 = int(endpoints[i, 0].item()) & 0xFFFF
+        ep1 = int(endpoints[i, 1].item()) & 0xFFFF
+        if ep0 < ep1:
+            endpoints[i, 0], endpoints[i, 1] = ep1, ep0
+            mapping = torch.tensor([1, 3, 2, 0], device=indices.device)
+            indices[i] = mapping[indices[i].clamp(0, 3)]
+        elif ep0 == ep1:
+            # Avoid BC1's transparent mode for equal endpoints.  The one-code
+            # endpoint change is preferable to silently decoding index 3 as
+            # transparent.
+            if ep0 < 0xFFFF:
+                endpoints[i, 0] = ep0 + 1
+            else:
+                endpoints[i, 1] = ep1 - 1
+            mapping = torch.tensor([0, 2, 3, 1], device=indices.device)
+            indices[i] = mapping[indices[i].clamp(0, 3)]
+        else:
+            mapping = torch.tensor([0, 2, 3, 1], device=indices.device)
+            indices[i] = mapping[indices[i].clamp(0, 3)]
+    return endpoints, indices
 
 
 def unpack_quantized_blocks_from_64b_bc1(
@@ -704,7 +780,7 @@ def unpack_quantized_blocks_from_64b_bc1(
 
 def unpack_and_decode_bc1_bytes(data: bytes, h: int, w: int) -> torch.Tensor:
     """解包BC1字节并解码为[3,H,W]张量"""
-    nb = (h // 4) * (w // 4)
+    nb = ((h + 3) // 4) * ((w + 3) // 4)
     endpoints, indices = unpack_quantized_blocks_from_64b_bc1(data, nb)
     # 转换为export_quantized_block_params的格式
     qp = {
@@ -725,16 +801,19 @@ def decode_bc1_params_to_mip(qp: dict) -> torch.Tensor:
     endpoints = qp["endpoints_q"].numpy()  # [NB,2] uint16 (RGB565)
     indices = qp["indices_q"].numpy()  # [NB,16] uint8
     h, w = qp["h"], qp["w"]
-    bw, bh = w // 4, h // 4
-    pixels = np.zeros((h, w, 3), dtype=np.uint8)
+    bw, bh = (w + 3) // 4, (h + 3) // 4
+    pixels = np.zeros((bh * 4, bw * 4, 3), dtype=np.float32)
 
     # BC1解码核心：RGB565解包 + 2bit索引插值
     def rgb565_to_rgb(ep):
-        # 解包RGB565：r(5bit), g(6bit), b(5bit) → 8bit
-        r = ((ep >> 11) & 0x1F) << 3
-        g = ((ep >> 5) & 0x3F) << 2
-        b = (ep & 0x1F) << 3
-        return np.array([r, g, b], dtype=np.uint8)
+        return np.array(
+            [
+                ((ep >> 11) & 0x1F) / 31.0,
+                ((ep >> 5) & 0x3F) / 63.0,
+                (ep & 0x1F) / 31.0,
+            ],
+            dtype=np.float32,
+        )
 
     for by in range(bh):
         for bx in range(bw):
@@ -743,8 +822,8 @@ def decode_bc1_params_to_mip(qp: dict) -> torch.Tensor:
             idx = indices[bi]
             # print(f"Block {bi}: ep0={ep0}, ep1={ep1}, idx={idx}")  # 打印输入
             # 解包端点
-            rgb0 = rgb565_to_rgb(ep0).astype(np.int32)
-            rgb1 = rgb565_to_rgb(ep1).astype(np.int32)
+            rgb0 = rgb565_to_rgb(ep0)
+            rgb1 = rgb565_to_rgb(ep1)
             # print(f"rgb0={rgb0}, rgb1={rgb1}")  # 打印解包后的颜色
             # 生成4x4像素（BC1插值规则）
             block_pixels = []
@@ -754,17 +833,17 @@ def decode_bc1_params_to_mip(qp: dict) -> torch.Tensor:
                 elif i == 1:
                     block_pixels.append(rgb1)
                 elif i == 2:
-                    block_pixels.append((2 * rgb0 + rgb1) // 3)
+                    block_pixels.append((2 * rgb0 + rgb1) / 3.0)
                 else:  # i==3
-                    block_pixels.append((rgb0 + 2 * rgb1) // 3)
-            block_pixels = np.array(block_pixels, dtype=np.uint8).reshape(4, 4, 3)
+                    block_pixels.append((rgb0 + 2 * rgb1) / 3.0)
+            block_pixels = np.array(block_pixels, dtype=np.float32).reshape(4, 4, 3)
 
             # 写入对应位置
             y0, x0 = by * 4, bx * 4
             pixels[y0:y0 + 4, x0:x0 + 4] = block_pixels
 
     # 转为CHW格式（PyTorch常用）
-    return torch.from_numpy(pixels).permute(2, 0, 1).to(torch.float32) / 255.0
+    return torch.from_numpy(pixels[:h, :w]).permute(2, 0, 1).to(torch.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -824,13 +903,18 @@ def _write_bc1_dds(mip_bytes_list: List[bytes],w0: int,h0: int,out_path: Path,):
             f.write(mip_data)
 
 @torch.no_grad()
-def export_trained_artifacts(model: NeuralMaterialCompressionModel, out_dir: Path):
+def export_trained_artifacts(
+    model: NeuralMaterialCompressionModel,
+    out_dir: Path,
+    save_debug_artifacts: bool = True,
+):
     """
     Export all runtime artifacts to out_dir (BC1/DXT1 VERSION).
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     meta_dir = out_dir / "metadata"
-    meta_dir.mkdir(parents=True, exist_ok=True)
+    if save_debug_artifacts:
+        meta_dir.mkdir(parents=True, exist_ok=True)
 
     # BC1 不支持 signed mode
     if hasattr(model, 'bc6_signed_mode') and model.bc6_signed_mode:
@@ -838,7 +922,8 @@ def export_trained_artifacts(model: NeuralMaterialCompressionModel, out_dir: Pat
 
     # --- Decoder weights ---
     state = model.decoder.state_dict()
-    torch.save(state, meta_dir / "decoder_state.pt")
+    if save_debug_artifacts:
+        torch.save(state, meta_dir / "decoder_state.pt")
     flat = []
     for k in ("fc1.weight", "fc1.bias", "fc2.weight", "fc2.bias", "fc3.weight", "fc3.bias"):
         flat.append(state[k].detach().to(torch.float16).contiguous().view(-1))
@@ -856,13 +941,20 @@ def export_trained_artifacts(model: NeuralMaterialCompressionModel, out_dir: Pat
         mip_bytes_list = []
         for m, (params, tex) in enumerate(zip(all_params, decoded_mips)):
             stem = f"latent_{i:02d}_mip_{m:02d}"
-            save_chw_png_ldr(tex, meta_dir / f"{stem}.png", signed_mode=False)
+            if save_debug_artifacts:
+                save_chw_png_ldr(tex, meta_dir / f"{stem}.png", signed_mode=False)
 
             # BC1 打包（64bit 块）
             packed_bytes = pack_quantized_blocks_to_64b(params)
 
             # 验证编码/解码一致性
-            expected_pixels = decode_bc1_params_to_mip(params)
+            canonical_endpoints, canonical_indices = _canonicalize_bc1_params(params)
+            canonical_params = {
+                **params,
+                "endpoints_q": canonical_endpoints.cpu(),
+                "indices_q": canonical_indices.cpu(),
+            }
+            expected_pixels = decode_bc1_params_to_mip(canonical_params)
             decoded_pixels = unpack_and_decode_bc1_bytes(
                 packed_bytes, h=params["h"], w=params["w"]
             )
@@ -877,8 +969,10 @@ def export_trained_artifacts(model: NeuralMaterialCompressionModel, out_dir: Pat
                 "latent_index": i,
                 "mip_index": m,
                 "shape_chw": list(tex.shape),
-                "png": f"metadata/{stem}.png",
+                "bytes": len(packed_bytes),
             })
+            if save_debug_artifacts:
+                latent_files[-1]["png"] = f"metadata/{stem}.png"
 
         # 写入 BC1 DDS
         W0, H0 = int(all_params[0]["w"]), int(all_params[0]["h"])
@@ -887,26 +981,34 @@ def export_trained_artifacts(model: NeuralMaterialCompressionModel, out_dir: Pat
         print(f"[export] BC1 latent {i:02d}: {W0}×{H0} → {dds_path.name}")
 
     meta = {
-        "version": 4,
+        "version": 5,
         "latent_count": model.n_latent,
         "latent_resolutions": model.latent_resolutions,
         "lod_biases": model.lod_biases,
+        "max_lod": model.max_lod,
+        "ref_base_res": model.ref_base_res,
         "bc_format": "BC1 (DXT1)",
         "bc_mode": 0,
         "endpoint_bits": 16,
+        "endpoint_channel_bits": [5, 6, 5],
         "index_bits": 2,
         "decoder": {
             "in_dim": int(model.decoder.fc1.in_features),
             "hidden_dim": int(model.decoder.fc1.out_features),
             "out_dim": int(model.decoder.fc3.out_features) if hasattr(model.decoder, 'fc3') else int(model.decoder.fc2.out_features),
             "weights_fp16_blob": "decoder_fp16.bin",
-            "state_dict": "metadata/decoder_state.pt",
+            "state_dict": "metadata/decoder_state.pt" if save_debug_artifacts else None,
             "mlp_structure": "fc1→fc2→fc3" if hasattr(model.decoder, 'fc3') else "fc1→fc2",
         },
         "latent_files": latent_files,
         "channel_mean": model.channel_mean.cpu().tolist(),
         "channel_std": model.channel_std.cpu().tolist(),
     }
+    meta["runtime_files"] = [
+        "gaussian_layout.json",
+        "metadata.json",
+        "decoder_fp16.bin",
+    ] + [f"latent_{i:02d}.bc1.dds" for i in range(model.n_latent)]
     (out_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
     print(f"[export] done → {out_dir}")
 
@@ -1027,8 +1129,12 @@ def train(model: NeuralMaterialCompressionModel, ref_mips: List[torch.Tensor], c
     channel_mean.zero_()
     channel_std.fill_(1.0)
     ref_mips_norm = ref_mips
-    channel_weight = 1.0 / raw_std
-    channel_weight = torch.clamp(channel_weight, max=10.0)
+    if cfg.channel_weighting:
+        channel_weight = torch.clamp(1.0 / raw_std, max=10.0)
+    else:
+        # The original BCF1 baseline uses reconstruction L1 without a rate
+        # term or material-specific channel reweighting.
+        channel_weight = torch.ones_like(raw_std)
     # Tile135D weight
     # Do not apply the original Tiles135D channel-specific weights to Gaussian data.
 
@@ -1037,8 +1143,7 @@ def train(model: NeuralMaterialCompressionModel, ref_mips: List[torch.Tensor], c
     model.channel_std.copy_(channel_std.squeeze())
 
     # 计算每个 batch 的总像素数
-    total_pixels = cfg.num_crops * cfg.crop_size * cfg.crop_size
-    print(f"Using crop-based sampling: {cfg.num_crops} crops of {cfg.crop_size}x{cfg.crop_size} → {total_pixels} pixels per batch")
+    print(f"Using random UV/LOD sampling: {cfg.batch_size} samples per iteration")
 
     # ---- Phase 2: BC1 constrained
     model.set_freeze_bc_features(False)
@@ -1055,8 +1160,14 @@ def train(model: NeuralMaterialCompressionModel, ref_mips: List[torch.Tensor], c
     pbar2 = tqdm(phase2_iter, desc="phase2", dynamic_ncols=True) if cfg.interactive_progress else None
     for it in (pbar2 or phase2_iter):
 
-        uv, lod = generate_crop_batch_correct(ref_base_res=ref_base_res, max_lod=max_lod, num_crops=cfg.num_crops,
-                                              crop_size=cfg.crop_size, device=device)
+        uv, lod = generate_crop_batch_correct(
+            ref_base_res=ref_base_res,
+            max_lod=max_lod,
+            num_crops=cfg.num_crops,
+            crop_size=cfg.crop_size,
+            batch_size=cfg.batch_size,
+            device=device,
+        )
 
         target = sample_mips_trilinear(ref_mips_norm, uv, lod, bilinear_mode="bilinear")
         pred = _fwd_bc(uv, lod)
@@ -1082,8 +1193,9 @@ def train(model: NeuralMaterialCompressionModel, ref_mips: List[torch.Tensor], c
     if pbar2:
         pbar2.close()
 
-    print("[checkpoint] Phase 2 完成，保存中间状态...")
-    _save_checkpoint(model, history, phase=2, iter=cfg.phase2_iters, export_dir=getattr(cfg, 'export_dir', None))
+    if cfg.save_debug_artifacts:
+        print("[checkpoint] Phase 2 complete; saving debug checkpoint...")
+        _save_checkpoint(model, history, phase=2, iter=cfg.phase2_iters, export_dir=getattr(cfg, 'export_dir', None))
 
     # ---- Phase3: finetune
     if cfg.phase3_iters > 0:
@@ -1093,7 +1205,14 @@ def train(model: NeuralMaterialCompressionModel, ref_mips: List[torch.Tensor], c
         pbar3 = tqdm(phase3_iter, desc="phase3", dynamic_ncols=True) if cfg.interactive_progress else None
 
         for it in (pbar3 or phase3_iter):
-            uv, lod = generate_crop_batch_correct(ref_base_res=ref_base_res, max_lod=max_lod,num_crops=cfg.num_crops, crop_size=cfg.crop_size, device=device)
+            uv, lod = generate_crop_batch_correct(
+                ref_base_res=ref_base_res,
+                max_lod=max_lod,
+                num_crops=cfg.num_crops,
+                crop_size=cfg.crop_size,
+                batch_size=cfg.batch_size,
+                device=device,
+            )
 
             # target = sample_mips_trilinear(ref_mips, uv, lod, bilinear_mode="bilinear")
             target = sample_mips_trilinear(ref_mips_norm, uv, lod, bilinear_mode="bilinear")
@@ -1113,52 +1232,72 @@ def train(model: NeuralMaterialCompressionModel, ref_mips: List[torch.Tensor], c
             pbar3.close()
 
     # === 最终checkpoint保存 ===
-    print("[checkpoint] 训练完成，保存最终模型状态...")
-    _save_checkpoint(model, history, phase=3, iter=cfg.phase3_iters, export_dir=getattr(cfg, 'export_dir', None))
+    if cfg.save_debug_artifacts:
+        print("[checkpoint] Training complete; saving final debug checkpoint...")
+        _save_checkpoint(model, history, phase=3, iter=cfg.phase3_iters, export_dir=getattr(cfg, 'export_dir', None))
 
     return history
 
 def train_from_tensor(reference: torch.Tensor, export_dir: Path, config=None):
     """Train directly from a normalised Gaussian attribute texture [C,H,W]."""
-    config = dict(config or {})
-    device = torch.device(config.get("device", "cuda"))
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested but is not available.")
-    reference = reference.detach().float().to(device)
-    if reference.ndim != 3 or reference.shape[1] != reference.shape[2]:
-        raise ValueError(f"Expected square [C,H,W] reference, got {tuple(reference.shape)}")
+    # SOG runs compression inside a torch.no_grad() block because the original
+    # JPEG codecs are non-differentiable.  The neural baseline performs a new,
+    # independent optimization and must explicitly re-enable autograd here.
+    with torch.enable_grad():
+        config = dict(config or {})
+        device = torch.device(config.get("device", "cuda"))
+        if device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but is not available.")
+        reference = reference.detach().float().to(device)
+        if reference.ndim != 3 or reference.shape[1] != reference.shape[2]:
+            raise ValueError(f"Expected square [C,H,W] reference, got {tuple(reference.shape)}")
 
-    ref_levels = int(config.get("ref_mips", int(math.log2(reference.shape[-1])) + 1))
-    ref_mips = build_mip_chain(reference, ref_levels)
-    latent_resolutions = list(config.get("latent_resolutions", [1024, 1024, 512, 512]))
-    latent_mips = list(config.get(
-        "latent_mips", [int(math.log2(x)) + 1 for x in latent_resolutions]
-    ))
-    model = NeuralMaterialCompressionModel(
-        latent_resolutions=latent_resolutions,
-        latent_mips=latent_mips,
-        out_channels=int(reference.shape[0]),
-        hidden_dim=int(config.get("hidden_dim", 64)),
-        ref_base_res=int(reference.shape[-1]),
-        max_lod=float(len(ref_mips) - 1),
-    ).to(device)
-    cfg = TrainConfig(
-        device=str(device),
-        batch_size=int(config.get("batch_size", 4096)),
-        phase2_iters=int(config.get("phase2_iters", 100000)),
-        phase3_iters=int(config.get("phase3_iters", 1000)),
-        lr_feat_phase2=float(config.get("lr_feat_phase2", 1e-2)),
-        lr_mlp_phase2=float(config.get("lr_mlp_phase2", 1e-3)),
-        gamma_phase2=float(config.get("gamma_phase2", 0.9999)),
-        lr_mlp_phase3=float(config.get("lr_mlp_phase3", 5e-4)),
-        log_every=int(config.get("log_every", 200)),
-        interactive_progress=bool(config.get("interactive_progress", False)),
-        num_crops=int(config.get("num_crops", 1)),
-        crop_size=int(config.get("crop_size", 256)),
+        ref_levels = int(config.get("ref_mips", int(math.log2(reference.shape[-1])) + 1))
+        ref_mips = build_mip_chain(reference, ref_levels)
+        configured_resolutions = config.get("latent_resolutions")
+        if configured_resolutions:
+            latent_resolutions = list(configured_resolutions)
+        else:
+            # BCF1 VarA baseline: W, W, W/2, W/2.  BC1 requires 4x4
+            # alignment, so non-multiple Gaussian grids are rounded down.
+            base = max(4, (int(reference.shape[-1]) // 4) * 4)
+            half = max(4, ((base // 2) // 4) * 4)
+            latent_resolutions = [base, base, half, half]
+        configured_mips = config.get("latent_mips")
+        latent_mips = list(configured_mips) if configured_mips else [
+            int(math.log2(x)) + 1 for x in latent_resolutions
+        ]
+        model = NeuralMaterialCompressionModel(
+            latent_resolutions=latent_resolutions,
+            latent_mips=latent_mips,
+            out_channels=int(reference.shape[0]),
+            hidden_dim=int(config.get("hidden_dim", 64)),
+            ref_base_res=int(reference.shape[-1]),
+            max_lod=float(len(ref_mips) - 1),
+        ).to(device)
+        cfg = TrainConfig(
+            device=str(device),
+            batch_size=int(config.get("batch_size", 4096)),
+            phase2_iters=int(config.get("phase2_iters", 100000)),
+            phase3_iters=int(config.get("phase3_iters", 1000)),
+            lr_feat_phase2=float(config.get("lr_feat_phase2", 1e-2)),
+            lr_mlp_phase2=float(config.get("lr_mlp_phase2", 1e-3)),
+            gamma_phase2=float(config.get("gamma_phase2", 0.9999)),
+            lr_mlp_phase3=float(config.get("lr_mlp_phase3", 5e-4)),
+            log_every=int(config.get("log_every", 200)),
+            interactive_progress=bool(config.get("interactive_progress", False)),
+            num_crops=int(config.get("num_crops", 1)),
+            crop_size=int(config.get("crop_size", 256)),
+            save_debug_artifacts=bool(config.get("save_debug_artifacts", True)),
+            channel_weighting=bool(config.get("channel_weighting", False)),
+        )
+        cfg.export_dir = Path(export_dir)
+        history = train(model, ref_mips, cfg)
+    export_trained_artifacts(
+        model,
+        Path(export_dir),
+        save_debug_artifacts=cfg.save_debug_artifacts,
     )
-    cfg.export_dir = Path(export_dir)
-    history = train(model, ref_mips, cfg)
-    export_trained_artifacts(model, Path(export_dir))
     return model, history
 
 

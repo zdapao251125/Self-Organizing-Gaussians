@@ -16,7 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 # 导入neuralmaterialsBC1，如果该文件移位，记得修改前面的路径
 from compression.neuralmaterialsBC1 import (  # noqa: E402
-    NeuralMaterialCompressionModel,
+    sample_mips_trilinear,
     train_from_tensor,
 )
 
@@ -51,6 +51,17 @@ def _normalise_chw(image: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, tor
 # 计算目录内所有普通文件的总大小
 def _directory_size(path: Path) -> int:
     return sum(file.stat().st_size for file in path.rglob("*") if file.is_file())
+
+
+def _runtime_directory_size(path: Path) -> int:
+    """Count only files needed to decode the compressed representation."""
+    metadata_path = path / "metadata.json"
+    if not metadata_path.exists():
+        return 0
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    files = set(metadata.get("runtime_files", []))
+    files.add("gaussian_layout.json")
+    return sum((path / name).stat().st_size for name in files if (path / name).is_file())
 
 # 压缩
 def compress_gaussians(gaussians, out_dir: str | os.PathLike, config=None) -> int:
@@ -113,35 +124,121 @@ def compress_gaussians(gaussians, out_dir: str | os.PathLike, config=None) -> in
     # 使用拼接后的多通道纹理训练神经压缩模型
     train_from_tensor(reference, out_dir, config)
 
-    # 返回整个输出目录的文件总大小，统计压缩结果体积
-    return _directory_size(out_dir)
+    # Checkpoints, PNG previews, and training history are debug artifacts and
+    # must not be counted as the compressed representation.
+    return _runtime_directory_size(out_dir)
 
-# 加载模型
-def _load_model(checkpoint_path: Path, device: torch.device):
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    valid_keys = {
-        "latent_resolutions",
-        "latent_mips",
-        "out_channels",
-        "hidden_dim",
-        "ref_base_res",
-        "max_lod",
-    }
-    
-    model_config = {
-        key: value
-        for key, value in checkpoint["config"].items()
-        if key in valid_keys
-    }
-    model = NeuralMaterialCompressionModel(**model_config).to(device)
+def _decode_bc1_payload(data: bytes, height: int, width: int, device: torch.device) -> torch.Tensor:
+    """Decode one standard BC1 mip into a [3,H,W] tensor."""
+    blocks_y, blocks_x = (height + 3) // 4, (width + 3) // 4
+    block_count = blocks_y * blocks_x
+    raw = np.frombuffer(data, dtype=np.uint8)
+    if raw.size != block_count * 8:
+        raise ValueError(f"BC1 payload size mismatch: {raw.size} != {block_count * 8}")
+    raw = raw.reshape(block_count, 8).astype(np.uint32)
+    ep0 = raw[:, 0] | (raw[:, 1] << 8)
+    ep1 = raw[:, 2] | (raw[:, 3] << 8)
+    selector_word = raw[:, 4] | (raw[:, 5] << 8) | (raw[:, 6] << 16) | (raw[:, 7] << 24)
 
-    # 加载训练后保存的模型参数
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.set_freeze_bc_features(True)
-    model.eval()
-    return model
+    def rgb565(value):
+        r = ((value >> 11) & 0x1F).astype(np.float32) / 31.0
+        g = ((value >> 5) & 0x3F).astype(np.float32) / 63.0
+        b = (value & 0x1F).astype(np.float32) / 31.0
+        return np.stack([r, g, b], axis=-1)
 
-# 使用神经压缩模型解码基础层级的完整纹理
+    c0, c1 = rgb565(ep0), rgb565(ep1)
+    palette_four = np.stack(
+        [c0, c1, (2.0 * c0 + c1) / 3.0, (c0 + 2.0 * c1) / 3.0], axis=1
+    )
+    palette_three = np.stack(
+        [c0, c1, (c0 + c1) / 2.0, np.zeros_like(c0)], axis=1
+    )
+    palette = np.where((ep0 > ep1)[:, None, None], palette_four, palette_three)
+    shifts = (2 * np.arange(16, dtype=np.uint32))[None, :]
+    selectors = ((selector_word[:, None] >> shifts) & 0x3).astype(np.int64)
+    pixels = palette[np.arange(block_count)[:, None], selectors]
+    pixels = pixels.reshape(blocks_y, blocks_x, 4, 4, 3)
+    pixels = pixels.transpose(4, 0, 2, 1, 3).reshape(3, blocks_y * 4, blocks_x * 4)
+    return torch.from_numpy(pixels[:, :height, :width].copy()).to(device=device, dtype=torch.float32)
+
+
+def _read_bc1_dds(path: Path, mip_entries, device: torch.device):
+    data = path.read_bytes()
+    if len(data) < 128 or data[:4] != b"DDS ":
+        raise ValueError(f"Invalid DDS file: {path}")
+    offset = 128
+    mips = []
+    for entry in sorted(mip_entries, key=lambda item: int(item["mip_index"])):
+        h, w = int(entry["shape_chw"][1]), int(entry["shape_chw"][2])
+        size = int(entry["bytes"])
+        payload = data[offset:offset + size]
+        if len(payload) != size:
+            raise ValueError(f"Truncated DDS mip in {path}")
+        mips.append(_decode_bc1_payload(payload, h, w, device))
+        offset += size
+    return mips
+
+
+class _RuntimeNeuralDecoder:
+    """Decode exported BC1 latent textures and the FP16 MLP directly."""
+
+    def __init__(self, out_dir: Path, metadata: dict, device: torch.device):
+        self.device = device
+        self.latents = []
+        for latent_index in range(int(metadata["latent_count"])):
+            entries = [
+                item for item in metadata["latent_files"]
+                if int(item["latent_index"]) == latent_index
+            ]
+            self.latents.append(
+                _read_bc1_dds(out_dir / f"latent_{latent_index:02d}.bc1.dds", entries, device)
+            )
+
+        decoder_meta = metadata["decoder"]
+        in_dim = int(decoder_meta["in_dim"])
+        hidden = int(decoder_meta["hidden_dim"])
+        out_dim = int(decoder_meta["out_dim"])
+        blob = np.frombuffer(
+            (out_dir / decoder_meta["weights_fp16_blob"]).read_bytes(), dtype="<f2"
+        )
+        expected = in_dim * hidden + hidden + hidden * hidden + hidden + out_dim * hidden + out_dim
+        if blob.size != expected:
+            raise ValueError(f"decoder_fp16.bin has {blob.size} values; expected {expected}")
+        values = torch.from_numpy(blob.astype(np.float32, copy=True)).to(device)
+        cursor = 0
+
+        def take(count, shape):
+            nonlocal cursor
+            result = values[cursor:cursor + count].reshape(shape)
+            cursor += count
+            return result
+
+        self.w1 = take(in_dim * hidden, (hidden, in_dim))
+        self.b1 = take(hidden, (hidden,))
+        self.w2 = take(hidden * hidden, (hidden, hidden))
+        self.b2 = take(hidden, (hidden,))
+        self.w3 = take(out_dim * hidden, (out_dim, hidden))
+        self.b3 = take(out_dim, (out_dim,))
+        self.max_lod = float(metadata.get("max_lod", 1.0))
+        self.lod_biases = [float(value) for value in metadata["lod_biases"]]
+        self.channel_mean = torch.tensor(metadata.get("channel_mean", [0.0] * out_dim), device=device)
+        self.channel_std = torch.tensor(metadata.get("channel_std", [1.0] * out_dim), device=device)
+
+    @torch.inference_mode()
+    def forward(self, uv: torch.Tensor, lod: torch.Tensor) -> torch.Tensor:
+        features = []
+        for mips, bias in zip(self.latents, self.lod_biases):
+            features.append(sample_mips_trilinear(mips, uv, lod + bias, bilinear_mode="bilinear"))
+        x = torch.cat(features, dim=1)
+        x = torch.cat([x, (lod / self.max_lod).unsqueeze(1)], dim=1)
+        if x.shape[1] < self.w1.shape[1]:
+            x = torch.nn.functional.pad(x, (0, self.w1.shape[1] - x.shape[1]))
+        x = torch.nn.functional.silu(torch.nn.functional.linear(x, self.w1, self.b1))
+        x = torch.nn.functional.silu(torch.nn.functional.linear(x, self.w2, self.b2))
+        return torch.nn.functional.linear(x, self.w3, self.b3) * self.channel_std + self.channel_mean
+
+
+# 使用导出的 BC1 latent 和 FP16 MLP 解码基础层级的完整纹理
 @torch.inference_mode()
 def _decode_base_texture(model, height: int, width: int, device, chunk_size: int):
     outputs = []
@@ -159,7 +256,7 @@ def _decode_base_texture(model, height: int, width: int, device, chunk_size: int
         lod = torch.zeros(end - begin, dtype=torch.float32, device=device)
 
         # 解码当前分块
-        outputs.append(model.forward_bc(uv, lod).cpu())
+        outputs.append(model.forward(uv, lod).cpu())
 
      # 拼接分块，恢复纹理形状
     return torch.cat(outputs, dim=0).T.reshape(-1, height, width)
@@ -177,8 +274,8 @@ def decompress_gaussians(out_dir: str | os.PathLike, config=None) -> Dict[str, n
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available.")
 
-    # 加载神经压缩模型及训练权重
-    model = _load_model(out_dir / "checkpoint.pt", device)
+    runtime_metadata = json.loads((out_dir / "metadata.json").read_text(encoding="utf-8"))
+    model = _RuntimeNeuralDecoder(out_dir, runtime_metadata, device)
 
     # 解码完整的多通道基础纹理
     decoded = _decode_base_texture(

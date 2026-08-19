@@ -1,0 +1,30 @@
+experiments:
+  - name: neural_texture_baseline
+    method: neural-texture-baseline
+    # This is the xym_neural_text baseline: BC1 latent features, a small MLP,
+    # and reconstruction L1 only.  No CDF/rate/entropy term is used.
+    attributes:
+      - name: _xyz
+      - name: _features_dc
+      - name: _features_rest
+      - name: _scaling
+      - name: _rotation
+      - name: _opacity
+    params:
+      device: cuda
+      hidden_dim: 64
+      # Omitted resolutions select VarA dynamically from the Gaussian grid:
+      # [W, W, W/2, W/2].
+      latent_resolutions: null
+      latent_mips: null
+      ref_mips: 11
+      batch_size: 4096
+      phase2_iters: 100000
+      phase3_iters: 1000
+      crop_size: 256
+      num_crops: 1
+      log_every: 200
+      interactive_progress: true
+      decode_chunk_size: 262144
+      save_debug_artifacts: false
+      channel_weighting: false
