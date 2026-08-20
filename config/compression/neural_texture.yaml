@@ -18,10 +18,11 @@ experiments:
       device: cuda
       interactive_progress: true
       log_every: 200
-      debug_every: 2000
       decode_chunk_size: 65536
-      save_debug_reference: true
-      debug_outlier_topk: 10
+      save_debug_reference: false
+      verbose_debug: false
+      debug_every: 0
+      debug_outlier_topk: 0
       gaussian_texel_center_sampling: true
       lod0_only: true
 
