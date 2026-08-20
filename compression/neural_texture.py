@@ -205,10 +205,6 @@ def _grid_continuity(name: str, chw: torch.Tensor, max_quantile_samples: int = 1
         f"quantile_samples={sample.numel()}/{count}"
     )
 
-
-# def _directory_size(path: Path) -> int:
-#     return sum(file.stat().st_size for file in path.rglob("*") if file.is_file())
-
 def _directory_size(path: Path) -> int:
 
     ignored_names = {
@@ -228,7 +224,6 @@ def _directory_size(path: Path) -> int:
         total_size += file.stat().st_size
 
     return total_size
-
 
 def _runtime_artifact_size(path: Path) -> int:
     """Size of intended deployment files, excluding checkpoints/debug previews."""
@@ -284,8 +279,7 @@ def _save_prediction_error_corrections(
             normalized = normalized.clamp(0.0, 1.0)
         reconstructed = normalized * scale + minimum
         original = original_grids[name].float()
-        # Score the pipeline after the existing source-tail overwrite, otherwise
-        # the new archive wastes capacity correcting values already stored.
+        # 在现有源尾部覆盖后对管道进行评分，否则新存档将浪费空间，因为需要修正已存储的值。
         tail_key = info.get("tail_key")
         if tail_archive is not None and tail_key and int(info.get("tail_count", 0)):
             scalar_indices = torch.from_numpy(
@@ -301,7 +295,7 @@ def _save_prediction_error_corrections(
             score = 2.0 * torch.acos((q0 * q1).sum(0).abs().clamp(0, 1 - 1e-7))
         else:
             score = (reconstructed - original).square().mean(0).sqrt()
-        # Prioritize errors on visible Gaussians for geometry/shape parameters.
+        # 优先处理可见高斯分布的几何/形状参数中的误差。
         if visibility is not None and name in ("_xyz", "_scaling", "_rotation"):
             score = score * (0.1 + 0.9 * visibility)
         count = min(total, max(1, int(round(total * attr_fraction))))
@@ -366,10 +360,8 @@ def compress_gaussians(gaussians, out_dir: str | os.PathLike, config=None) -> in
         _stats(f"normalization_scale/{name}", scale)
         _compare(f"normalization_core_roundtrip/{name}", normalised * scale + minimum, clipped)
         tail_key = f"attr_{len(layout)}"
-        # Store absolute original values, not original-minus-clipped residuals.
-        # Adding a source residual assumes the neural decoder reproduced the
-        # clipped boundary exactly; absolute overwrite remains correct even when
-        # the decoder is inaccurate at a tail location.
+        # 存储绝对原始值，而非原始值减去裁剪后的残差。
+        # 添加源残差时假设神经解码器准确复现了裁剪边界；即使解码器在尾部位置不准确，绝对覆盖仍保持正确。
         original_tail_values = chw.reshape(-1)[tail_indices]
         stored_tail_values_np = original_tail_values.cpu().numpy().astype(tail_numpy_dtype)
         stored_tail_values = torch.from_numpy(
@@ -431,8 +423,6 @@ def compress_gaussians(gaussians, out_dir: str | os.PathLike, config=None) -> in
         f"{(out_dir / 'tail_residuals.npz').stat().st_size / 1024**2:.3f} MiB"
     )
 
-
-
     # -------------------------------------------------
     # 调试数据：保存训练使用的归一化参考纹理。
     #
@@ -474,8 +464,7 @@ def compress_gaussians(gaussians, out_dir: str | os.PathLike, config=None) -> in
         )
         torch.save(debug_original_grids, out_dir / "debug_original_grids.pt")
 
-    # Pass the per-channel inverse-normalisation metadata to training so losses
-    # can be evaluated in the real Gaussian parameter domain as well as [0, 1].
+    # 将每通道的逆归一化元数据传递给训练，以便损失函数既可以在真实的高斯参数域中评估，也可以在[0,1]范围内进行评估。
     channel_minimum = []
     channel_scale = []
     for info in layout.values():
@@ -499,7 +488,6 @@ def compress_gaussians(gaussians, out_dir: str | os.PathLike, config=None) -> in
         json.dumps(metadata, indent=2), encoding="utf-8"
     )
 
-    # debug_reference.pt 已在 _directory_size() 中排除
     total_size = _directory_size(out_dir)
     runtime_size = _runtime_artifact_size(out_dir)
 
@@ -513,7 +501,6 @@ def compress_gaussians(gaussians, out_dir: str | os.PathLike, config=None) -> in
         "(DDS + FP16 decoder + runtime metadata)"
     )
 
-    # train_from_tensor(reference, out_dir, config)
     return runtime_size
 
 
@@ -536,8 +523,6 @@ def _load_model(checkpoint_path: Path, device: torch.device):
         if key in valid_keys
     }
     if "separate_gaussian_decoders" not in model_config:
-        # Checkpoints produced before the split-decoder patch contain only the
-        # old `decoder.*` keys and must retain the old architecture.
         model_config["separate_gaussian_decoders"] = any(
             key.startswith("features_rest_decoder.")
             for key in checkpoint["model_state_dict"]
@@ -807,8 +792,7 @@ def decompress_gaussians(out_dir: str | os.PathLike, config=None) -> Dict[str, n
         # -------------------------------------------------
         # 将预测值限制到训练目标范围
         # -------------------------------------------------
-        # Component-wise clamp changes quaternion direction. Rotation is
-        # denormalized first and projected to the unit sphere below.
+        # 按组件分量夹紧会改变四元数的方向。旋转首先被去归一化，然后投影到下方的单位球面上。
         value = (
             value_raw
             if name == "_rotation" and not bool(
@@ -858,8 +842,7 @@ def decompress_gaussians(out_dir: str | os.PathLike, config=None) -> Dict[str, n
                 value_flat[indices] = stored_values
                 action = "overwritten"
             else:
-                # Backward compatibility with old archives containing
-                # original-minus-clipped residuals.
+                # 与包含原始减去裁剪残差的旧存档实现向后兼容。
                 value_flat[indices] += stored_values
                 action = "residual-added (legacy)"
             print(
@@ -875,7 +858,7 @@ def decompress_gaussians(out_dir: str | os.PathLike, config=None) -> Dict[str, n
             vectors = torch.from_numpy(
                 correction_archive[f"{correction_key}_values"].astype(np.float32, copy=False)
             ).to(value.dtype)
-            # Archive layout is [K,C], while the texture view is [C,H*W].
+            # 归档布局为[K,C]，而纹理视图为[C,H*W]。
             value.reshape(value.shape[0], -1)[:, indices] = vectors.T
             print(
                 f"[prediction-correction:{name}] overwritten={indices.numel()} vectors"

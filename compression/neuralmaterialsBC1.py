@@ -49,7 +49,7 @@ except Exception:
 BC1_ENDPOINT_BITS = 16
 BC1_INDEX_BITS = 2
 BC1_BLOCK_SIZE_BITS = 64  # 每个4x4块64位
-# Standard four-colour BC1 palette, expressed as the weight of endpoint 1:
+# 标准四色BC1色阶，以端点1的重量表示：
 # index 0 -> ep0, 1 -> ep1, 2 -> 2/3 ep0 + 1/3 ep1,
 # index 3 -> 1/3 ep0 + 2/3 ep1.
 BC1_INTERP_WEIGHTS = [0.0, 1.0, 1.0 / 3.0, 2.0 / 3.0]
@@ -137,8 +137,7 @@ def rgb_to_rgb565(rgb: torch.Tensor) -> torch.Tensor:
         [*] 整数张量 (0-65535)
     """
     # 量化到对应位数：R(5bit), G(6bit), B(5bit)
-    # int16 is signed: RGB565 values with bit 15 set would become negative and
-    # corrupt subsequent integer packing. Keep the packed value in int32.
+    # int16 有符号，当 RGB565 值的第 15 位被设置时，会变为负数，并导致后续整数打包损坏。因此将打包后的值保存为 int32。
     r = (rgb[..., 0] * 31.0).clamp(0, 31).round().to(torch.int32)
     g = (rgb[..., 1] * 63.0).clamp(0, 63).round().to(torch.int32)
     b = (rgb[..., 2] * 31.0).clamp(0, 31).round().to(torch.int32)
@@ -196,7 +195,7 @@ def sample_texture_chw(tex_chw: torch.Tensor, uv: torch.Tensor, mode: str) -> to
     """Samples [C,H,W] at uv [B,2] in [0,1], returns [B,C]."""
     sample_mode = mode
     if tex_chw.device.type == "mps":
-        # MPS backend does not support border padding in grid_sample.
+        # MPS后端不支持grid_sample中的边框填充。
         uv = uv.clamp(1e-4, 1.0 - 1e-4)
         padding_mode = "zeros"
         if sample_mode == "bicubic":
@@ -283,10 +282,8 @@ def generate_crop_batch_correct(
     uv = torch.cat(all_uv, dim=0)
     lod = torch.cat(all_lod, dim=0)
 
-    # Uniform crop origins dramatically oversample central pixels: an edge pixel
-    # belongs to only one origin while a central pixel belongs to ~crop_size
-    # origins. Replace a configurable fraction with globally uniform pixel
-    # samples so borders/corners receive equal training probability.
+    # 统一裁剪起源会显著过采中心像素：边缘像素仅属于一个起源，而中心像素则属于约 crop_size 个起源。
+    # 将可配置比例替换为全局均匀的像素采样，使边界/角落区域获得相等的训练概率。
     ratio = float(uniform_sample_ratio)
     if not 0.0 <= ratio <= 1.0:
         raise ValueError(f"uniform_sample_ratio must be in [0,1], got {ratio}")
@@ -394,8 +391,7 @@ class BC1SurrogateBlockLevel(nn.Module):
         index_hard = ste_round(index_float)
         palette = x_n.new_tensor(BC1_INTERP_WEIGHTS)
         hard_weights = palette[index_hard.detach().long().clamp(0, 3)]
-        # Use the standard BC1 palette in the forward pass and a straight-through
-        # gradient through the continuous index parameter.
+        # 在前向传播中使用标准的BC1配色方案，并通过连续索引参数进行直线梯度传递。
         weights = x_n + (hard_weights - x_n).detach()
 
         # 3. BC1线性插值计算
@@ -427,9 +423,8 @@ class BC1SurrogateBlockLevel(nn.Module):
             e_q = torch.round(e_n * ((1 << BC1_ENDPOINT_BITS) - 1)).to(torch.int16)
         x_n = torch.sigmoid(self.indices)
         x_q = torch.round(x_n * ((1 << BC1_INDEX_BITS) - 1)).to(torch.uint8)
-        # BC1 uses the four-colour palette only when endpoint0 > endpoint1.
-        # Canonicalise here so the exported params, packed bytes and verification
-        # decoder all have exactly the same semantics.
+        # # BC1 只有在 endpoint0 > endpoint1 时才使用四色调色板。
+        # 这里进行规范化，以确保导出的参数、打包字节和验证解码器具有完全相同的语义。
         swap = e_q[:, 0] <= e_q[:, 1]
         if swap.any():
             e_q = e_q.clone()
@@ -598,7 +593,7 @@ class NeuralMaterialCompressionModel(nn.Module):
             separate_gaussian_decoders and out_channels == 59
         )
         if self.separate_gaussian_decoders:
-            # Base output order: xyz(3), features_dc(3), rotation(4), opacity(1).
+            # 基础输出顺序: xyz(3), features_dc(3), rotation(4), opacity(1).
             self.decoder = MaterialDecoderMLP(decoder_in_dim, hidden_dim, 11)
             self.features_rest_decoder = MaterialDecoderMLP(
                 decoder_in_dim, features_rest_decoder_hidden_dim, 45
@@ -653,7 +648,7 @@ class NeuralMaterialCompressionModel(nn.Module):
         base = self.decoder(x)
         features_rest = self.features_rest_decoder(x)
         scaling = self.scaling_decoder(x)
-        # Restore the canonical 59-channel Gaussian layout.
+        # 恢复标准的59通道高斯布局。
         return torch.cat(
             (base[:, 0:6], features_rest, scaling, base[:, 6:10], base[:, 10:11]),
             dim=1,
@@ -694,7 +689,7 @@ class NeuralMaterialCompressionModel(nn.Module):
         self.set_freeze_bc_features(True)
 
 
-# Backward-compatible aliases for existing imports/scripts.
+# 与现有导入/脚本兼容的后向兼容别名。
 # UnconstrainedLatentPyramid = WarmupLatentPyramid
 BCBlockMip = BC1SurrogateBlockLevel
 BCBlockPyramid = BC1SurrogatePyramid
@@ -703,7 +698,7 @@ NeuralMaterialModel = NeuralMaterialCompressionModel
 
 
 # -------------------------------
-# Training config and loop
+# 训练配置和循环
 # -------------------------------
 
 @dataclass
@@ -798,11 +793,11 @@ def save_chw_png_ldr(t: torch.Tensor, out_path: Path, signed_mode: bool = False)
     x = x[:3]
 
     if signed_mode:
-        # Signed mode: latents in [-1, 1], convert to [0, 1] then uint8
+        # Signed mode: 将[-1, 1]范围内的latents转换为[0, 1]，然后转为uint8
         x = x.clamp(-1.0, 1.0)
         x = ((x + 1.0) * 0.5 * 255.0).round().to(torch.uint8)
     else:
-        # Unsigned mode: latents already in [0, 1], just convert to uint8
+        # Unsigned mode: 已经在 [0, 1] 范围内的latents，只需转换为 uint8 即可
         x = x.clamp(0.0, 1.0)
         x = (x * 255.0).round().to(torch.uint8)
 
@@ -839,8 +834,7 @@ def pack_quantized_blocks_to_64b(qp: dict) -> bytes:
         ep1 = int(endpoints[i, 1].item())
         idx = indices[i].clone()  # 训练索引
 
-        # Force the standard four-colour BC1 mode.  When endpoints are swapped,
-        # remap palette indices so the represented colours stay unchanged.
+        # 强制使用标准的四色BC1模式。当端点交换时，重新映射调色板索引，以确保所表示的颜色保持不变。
         if ep0 <= ep1:
             ep0, ep1 = ep1, ep0
             swap_map = torch.tensor([1, 0, 3, 2], device=idx.device)
@@ -970,8 +964,8 @@ def decode_bc1_params_to_mip(qp: dict) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# Legacy single-subset BC6H helpers kept during the Mode 10 cleanup.
-# The canonical target is spec-correct Mode 10 packing/export.
+# 在Mode 10清理期间保留下来的Legacy单子集BC6H辅助程序。  
+# 标准目标是符合规范的Mode 10打包/导出。
 # ---------------------------------------------------------------------------
 
 import struct as _struct
@@ -1220,10 +1214,9 @@ def gaussian_attribute_loss(
     weights = {
         "xyz": 20.0, "features_dc": 5.0,
         "features_rest": cfg.features_rest_weight,
-        # Raw-domain terms below carry most scaling/rotation supervision.
-        # Do not use ordinary component L1 for rotation here: q and -q are
-        # equivalent, and it conflicts with an angle-only objective. Rotation
-        # is supervised below with sign alignment plus an explicit norm term.
+        # 以下原始域术语具有最强的缩放/旋转监督。
+        # 此处不要使用普通的组件L1进行旋转：q和-q是等价的，且与仅基于角度的目标冲突。
+        # 旋转在下方通过符号对齐以及显式的范数项进行监督。
         "scaling": 2.0, "rotation": 0.0, "opacity": 10.0,
     }
     loss = sum(
@@ -1237,13 +1230,12 @@ def gaussian_attribute_loss(
     pred_raw = pred * raw_scale + raw_minimum
     target_raw = target * raw_scale + raw_minimum
 
-    # World-space position supervision with an additional squared tail penalty.
+    # 带额外平方尾部惩罚的全局空间位置监督。
     xyz_delta = pred_raw[:, 0:3] - target_raw[:, 0:3]
     xyz_loss = F.smooth_l1_loss(pred_raw[:, 0:3], target_raw[:, 0:3])
     xyz_tail = xyz_delta.square().mean().sqrt()
 
-    # _scaling is log-scale. Penalize both log error and multiplicative physical
-    # scale ratio, while clamping the exponent for stable gradients.
+    # _scaling 采用对数尺度。同时惩罚对数误差和乘法物理尺度比，同时限制指数以确保梯度稳定。
     scaling_delta = pred_raw[:, 51:54] - target_raw[:, 51:54]
     scaling_log_loss = F.smooth_l1_loss(
         pred_raw[:, 51:54], target_raw[:, 51:54]
@@ -1253,8 +1245,7 @@ def gaussian_attribute_loss(
 
     pred_rest, target_rest = pred[:, 6:51], target[:, 6:51]
     features_rest_mse = F.mse_loss(pred_rest, target_rest)
-    # Direct L1 is intentional: Smooth-L1 becomes quadratic for the relatively
-    # small std gap and was numerically too weak to prevent variance collapse.
+    # Direct L1部分：对于相对较小的标准差差距，Smooth-L1 变为二次函数，但在数值上过于薄弱，无法防止方差崩溃。
     features_rest_variance = (
         pred_rest.std(dim=0, unbiased=False)
         - target_rest.std(dim=0, unbiased=False)
@@ -1264,20 +1255,18 @@ def gaussian_attribute_loss(
         - target_rest.square().mean(dim=0).sqrt()
     ).abs().mean()
 
-    # q and -q represent the same rotation. Normalize both sides and optimize
-    # their geodesic angular distance rather than component-wise L1 alone.
+    # q 和 -q 表示相同的旋转。对两边进行归一化，并优化它们的测地角距离，而不是仅使用分量上的 L1 距离。
     q_pred_raw = pred_raw[:, 54:58]
     q_target_raw = target_raw[:, 54:58]
     q_pred = F.normalize(q_pred_raw, dim=1, eps=EPS)
     q_target = F.normalize(q_target_raw, dim=1, eps=EPS)
     signed_dot = (q_pred * q_target).sum(dim=1, keepdim=True)
-    # Align the predicted sign to the target before comparing components.
-    # detach() keeps this discrete choice out of the gradient graph.
+    # 在比较组件之前，先将预测的符号对齐到目标上。  
+    # detach() 会将这个离散选择排除在梯度图之外。
     sign = torch.where(signed_dot.detach() < 0.0, -1.0, 1.0)
     q_pred_aligned = q_pred * sign
     rotation_aligned = F.smooth_l1_loss(q_pred_aligned, q_target)
-    # Angular loss alone is invariant to |q| and allowed the decoder output to
-    # collapse close to zero. Keep raw decoded quaternions near unit length.
+    # 仅Angular损失对|q|不敏感，使得解码器输出能够接近零。保持原始解码的四元数长度接近单位长度。
     rotation_norm = F.smooth_l1_loss(
         q_pred_raw.norm(dim=1), torch.ones_like(q_pred_raw[:, 0])
     )
@@ -1303,8 +1292,7 @@ def debug_error_quantiles(stage: str, pred: torch.Tensor, target: torch.Tensor) 
     for attr, begin, end in GAUSSIAN_CHANNELS:
         if pred.shape[1] < end:
             continue
-        # One error magnitude per sample/Gaussian, so wide attributes do not
-        # dominate merely by having more channels.
+        # 每个样本/高斯误差的幅度相同，因此宽属性并不仅因通道更多而占据主导地位。
         err = (pred[:, begin:end] - target[:, begin:end]).square().mean(1).sqrt()
         qs = torch.quantile(err.float(), err.new_tensor([0.50, 0.95, 0.99, 0.999]))
         print(
@@ -1421,9 +1409,8 @@ def full_grid_validation(
             qt = F.normalize(target_raw[:, 54:58], dim=1, eps=EPS)
             angle = 2.0 * torch.acos((qp * qt).sum(1).abs().clamp(0, 1 - 1e-7))
             rotation_angles[begin_index:end_index] = (angle * 180.0 / math.pi).cpu()
-            # q and -q encode the same rotation. Replace ordinary encoded
-            # component MSE in checkpoint scoring with sign-invariant unit-q
-            # chordal error, while preserving four-channel weighting.
+            # q 和 -q 编码相同的旋转。
+            # 在检查点评分中，用符号不变的单位-q 弦状误差替换普通编码的分量均方误差，同时保持四通道加权。
             q_mse = torch.minimum(
                 (qp - qt).square().mean(1), (qp + qt).square().mean(1)
             )
@@ -1566,10 +1553,8 @@ def train(model: NeuralMaterialCompressionModel, ref_mips: List[torch.Tensor], c
         if C >= end:
             debug_tensor(f"reference/{attr}", ref_base[begin:end])
 
-    # Preserve the material version's useful inverse-std balancing, but normalize
-    # it inside each semantic attribute so it cannot silently change that
-    # attribute's overall configured weight. This balances difficult SH channels
-    # without letting low-variance channels dominate the complete objective.
+    # 保留材料版本中对逆标准有用的平衡，但将其规范化到每个语义属性内部，防止其改变该属性的整体配置权重。
+    # 这能够在不使低方差通道主导整个目标的情况下平衡复杂的SH通道。
     normalized_std = ref_base.std(dim=(1, 2), unbiased=False).clamp_min(1e-4)
     channel_balance = normalized_std.reciprocal()
     for attr, begin, end in GAUSSIAN_CHANNELS:
@@ -1600,8 +1585,7 @@ def train(model: NeuralMaterialCompressionModel, ref_mips: List[torch.Tensor], c
     # print("channel_mean:", channel_mean)
     # print("channel_std:", channel_std)
     ref_mips_norm = [(mip - channel_mean) / channel_std for mip in ref_mips]
-    # Override the material-specific Albedo transform: Gaussian attributes were
-    # already normalised independently by compression/neural_texture.py.
+    # 覆盖材料特定的反照率变换：高斯属性已由 compression/neural_texture.py 独立归一化。
     channel_mean.zero_()
     channel_std.fill_(1.0)
     ref_mips_norm = ref_mips
@@ -1626,7 +1610,7 @@ def train(model: NeuralMaterialCompressionModel, ref_mips: List[torch.Tensor], c
 
 
     # Tile135D weight
-    # Do not apply the original Tiles135D channel-specific weights to Gaussian data.
+    # 不要将原始的 Tiles135D 频道特定权重应用于高斯数据。
 
     # 将 mean 和 std 注册到模型（作为 buffer，不参与训练）
     model.channel_mean.copy_(channel_mean.squeeze())
@@ -1662,9 +1646,8 @@ def train(model: NeuralMaterialCompressionModel, ref_mips: List[torch.Tensor], c
         if cfg.lod0_only:
             lod.zero_()
 
-        # A Gaussian grid is a table of discrete records, not a continuous
-        # material image. At LOD0, sub-pixel jitter would blend neighbouring
-        # Gaussians and train the model toward artificially smoothed targets.
+        # 高斯网格是一组离散记录的表格，而非连续的物质图像。
+        # 在LOD0时，亚像素抖动会混合相邻的高斯函数，并使模型趋向于人工平滑的目标。
         target = (
             sample_discrete_texels(ref_base, uv)
             if cfg.lod0_only and cfg.gaussian_texel_center_sampling
@@ -1820,9 +1803,8 @@ def train_from_tensor(reference: torch.Tensor, export_dir: Path, config=None):
 
     ref_levels = int(config.get("ref_mips", int(math.log2(reference.shape[-1])) + 1))
     ref_mips = build_mip_chain(reference, ref_levels)
-    # Gaussian attributes contain far more information than the original 9-channel
-    # material input. Use six higher-resolution BC1 latents (18 sampled features)
-    # by default instead of four low-resolution latents (12 features).
+    # 高斯属性包含比原始9通道材料输入更多的信息。
+    # 默认情况下，使用六个更高分辨率的BC1潜在变量（18个采样特征），而不是四个低分辨率的潜在变量（12个特征）。
     latent_resolutions = list(config.get(
         "latent_resolutions", [2048, 2048, 2048, 2048, 1024, 1024, 1024, 1024]
     ))
