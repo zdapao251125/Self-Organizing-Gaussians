@@ -45,6 +45,58 @@ def _normalise_chw(image: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, tor
     return (image - minimum) / scale, minimum, scale
 
 
+def _normalise_chw_with_sparse_tails(
+    image: torch.Tensor,
+    tail_fraction: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Robust per-channel normalization plus an exactly addressable sparse tail.
+
+    Returns normalized/clipped data, low, scale, clipped data, flat CHW indices,
+    and residual values. Quantiles are computed one channel at a time to avoid
+    torch.quantile's large-input limitation.
+    """
+    if not 0.0 <= tail_fraction < 0.5:
+        raise ValueError(f"tail_fraction must be in [0, 0.5), got {tail_fraction}")
+    if tail_fraction == 0.0:
+        normalized, minimum, scale = _normalise_chw(image)
+        empty_i = torch.empty(0, dtype=torch.int64)
+        empty_v = torch.empty(0, dtype=image.dtype)
+        return normalized, minimum, scale, image, empty_i, empty_v
+
+    flat = image.reshape(image.shape[0], -1)
+    lows, highs = [], []
+    for channel in range(flat.shape[0]):
+        values = flat[channel]
+        q = torch.quantile(
+            values,
+            values.new_tensor([tail_fraction, 1.0 - tail_fraction]),
+        )
+        lows.append(q[0])
+        highs.append(q[1])
+    minimum = torch.stack(lows).reshape(-1, 1, 1)
+    maximum = torch.stack(highs).reshape(-1, 1, 1)
+    scale = (maximum - minimum).clamp_min(1e-8)
+    clipped = torch.maximum(torch.minimum(image, maximum), minimum)
+    normalized = (clipped - minimum) / scale
+    residual = image - clipped
+    tail_mask = residual != 0
+    tail_indices = tail_mask.reshape(-1).nonzero(as_tuple=False).squeeze(1)
+    tail_values = residual.reshape(-1)[tail_indices]
+    return normalized, minimum, scale, clipped, tail_indices, tail_values
+
+
+def _canonicalize_quaternion_chw(chw: torch.Tensor) -> torch.Tensor:
+    """Choose one deterministic representative from equivalent q/-q pairs."""
+    if chw.shape[0] != 4:
+        raise ValueError(f"Expected four rotation channels, got {chw.shape[0]}")
+    q = chw.permute(1, 2, 0).reshape(-1, 4)
+    pivot = q.abs().argmax(dim=1, keepdim=True)
+    pivot_value = q.gather(1, pivot)
+    sign = torch.where(pivot_value < 0, -torch.ones_like(pivot_value), torch.ones_like(pivot_value))
+    q = q * sign
+    return q.reshape(chw.shape[1], chw.shape[2], 4).permute(2, 0, 1).contiguous()
+
+
 def _stats(stage: str, value: torch.Tensor) -> None:
     x = value.detach().float().cpu()
     finite = torch.isfinite(x)
@@ -116,7 +168,12 @@ def _error_quantiles_and_outliers(
 
 
 def _grid_continuity(name: str, chw: torch.Tensor, max_quantile_samples: int = 1_000_000) -> None:
-    """Measure 2-D locality without sorting an enormous multi-channel tensor."""
+    """Measure 2-D locality without sorting an enormous multi-channel tensor.
+
+    The mean uses every horizontal/vertical neighbour. Quantiles use a
+    deterministic strided sample capped at ``max_quantile_samples``; otherwise
+    45 SH channels at a 1264-square grid exceed torch.quantile's input limit.
+    """
     per_direction = max(1, int(max_quantile_samples) // 2)
 
     def _strided_sample(value: torch.Tensor) -> torch.Tensor:
@@ -175,9 +232,100 @@ def _directory_size(path: Path) -> int:
 
 def _runtime_artifact_size(path: Path) -> int:
     """Size of intended deployment files, excluding checkpoints/debug previews."""
-    names = {"decoder_fp16.bin", "metadata.json", "gaussian_layout.json"}
+    names = {
+        "decoder_fp16.bin", "metadata.json", "gaussian_layout.json",
+        "tail_residuals.npz", "prediction_corrections.npz",
+        "decoder_features_rest_fp16.bin", "decoder_scaling_fp16.bin",
+    }
     files = [p for p in path.iterdir() if p.is_file() and (p.name in names or p.name.endswith(".bc1.dds"))]
     return sum(p.stat().st_size for p in files)
+
+@torch.no_grad()
+def _save_prediction_error_corrections(
+    model, reference, original_grids, layout, out_dir, config
+):
+    """Store exact vectors for the worst *post-training* Gaussian errors.
+
+    Source-value tails and prediction-error tails are different sets. This
+    second sparse layer is selected only after quantized decoding, and stores
+    complete attribute vectors per spatial Gaussian to avoid inconsistent
+    component-wise repairs.
+    """
+    fraction = float(config.get("prediction_correction_fraction", 0.002))
+    if fraction <= 0.0:
+        return
+    device = next(model.parameters()).device
+    was_training = model.training
+    model.eval()
+    decoded = _decode_base_texture(
+        model, int(reference.shape[1]), int(reference.shape[2]), device,
+        int(config.get("decode_chunk_size", 262144)),
+    )
+    dtype_name = str(config.get("prediction_correction_dtype", "float16")).lower()
+    if dtype_name not in ("float16", "float32"):
+        raise ValueError("prediction_correction_dtype must be float16 or float32")
+    np_dtype = np.float16 if dtype_name == "float16" else np.float32
+    per_attr = config.get("prediction_correction_fractions", {}) or {}
+    opacity = original_grids.get("_opacity")
+    visibility = None if opacity is None else torch.sigmoid(opacity.float()).squeeze(0)
+    archive = {}
+    tail_path = Path(out_dir) / "tail_residuals.npz"
+    tail_archive = np.load(tail_path, allow_pickle=False) if tail_path.exists() else None
+    total = int(reference.shape[1] * reference.shape[2])
+    for attr_id, (name, info) in enumerate(layout.items()):
+        attr_fraction = float(per_attr.get(name, fraction))
+        if attr_fraction <= 0.0:
+            continue
+        start, end = int(info["start"]), int(info["end"])
+        minimum = torch.tensor(info["minimum"]).reshape(-1, 1, 1)
+        scale = torch.tensor(info["scale"]).reshape(-1, 1, 1)
+        normalized = decoded[start:end].cpu()
+        if name != "_rotation":
+            normalized = normalized.clamp(0.0, 1.0)
+        reconstructed = normalized * scale + minimum
+        original = original_grids[name].float()
+        # Score the pipeline after the existing source-tail overwrite, otherwise
+        # the new archive wastes capacity correcting values already stored.
+        tail_key = info.get("tail_key")
+        if tail_archive is not None and tail_key and int(info.get("tail_count", 0)):
+            scalar_indices = torch.from_numpy(
+                tail_archive[f"{tail_key}_indices"].astype(np.int64, copy=False)
+            )
+            tail_values = torch.from_numpy(
+                tail_archive[f"{tail_key}_residuals"].astype(np.float32, copy=False)
+            )
+            reconstructed.reshape(-1)[scalar_indices] = tail_values
+        if name == "_rotation":
+            q0 = torch.nn.functional.normalize(reconstructed, dim=0, eps=1e-8)
+            q1 = torch.nn.functional.normalize(original, dim=0, eps=1e-8)
+            score = 2.0 * torch.acos((q0 * q1).sum(0).abs().clamp(0, 1 - 1e-7))
+        else:
+            score = (reconstructed - original).square().mean(0).sqrt()
+        # Prioritize errors on visible Gaussians for geometry/shape parameters.
+        if visibility is not None and name in ("_xyz", "_scaling", "_rotation"):
+            score = score * (0.1 + 0.9 * visibility)
+        count = min(total, max(1, int(round(total * attr_fraction))))
+        indices = torch.topk(score.reshape(-1), count, largest=True, sorted=False).indices
+        values = original.reshape(original.shape[0], -1)[:, indices].T.contiguous()
+        key = f"attr_{attr_id}"
+        archive[f"{key}_indices"] = indices.numpy().astype(np.uint32)
+        archive[f"{key}_values"] = values.numpy().astype(np_dtype)
+        info["prediction_correction_key"] = key
+        info["prediction_correction_count"] = count
+        info["prediction_correction_fraction"] = attr_fraction
+        print(
+            f"[prediction-correction:{name}] vectors={count}/{total} "
+            f"fraction={count / total:.4%} score_min={score.reshape(-1)[indices].min().item():.6g}"
+        )
+    if archive:
+        path = Path(out_dir) / "prediction_corrections.npz"
+        np.savez_compressed(path, **archive)
+        print(f"[prediction-correction] saved {path} ({path.stat().st_size / 1024**2:.3f} MiB)")
+    if tail_archive is not None:
+        tail_archive.close()
+    if was_training:
+        model.train()
+
 
 def compress_gaussians(gaussians, out_dir: str | os.PathLike, config=None) -> int:
     config = dict(config or {})
@@ -188,6 +336,14 @@ def compress_gaussians(gaussians, out_dir: str | os.PathLike, config=None) -> in
     normalised_images = []
     layout = {}
     debug_original_grids = {}
+    sparse_tail_arrays = {}
+    tail_fraction = float(config.get("tail_fraction", 0.001))
+    tail_dtype_name = str(config.get("tail_residual_dtype", "float16")).lower()
+    if tail_dtype_name not in ("float16", "float32"):
+        raise ValueError("tail_residual_dtype must be 'float16' or 'float32'")
+    tail_numpy_dtype = np.float16 if tail_dtype_name == "float16" else np.float32
+    tail_attributes_cfg = config.get("tail_attributes")
+    tail_attributes = set(tail_attributes_cfg) if tail_attributes_cfg else set(_attribute_names(config))
 
     for name in _attribute_names(config):
         tensor = getattr(gaussians, name)
@@ -196,13 +352,45 @@ def compress_gaussians(gaussians, out_dir: str | os.PathLike, config=None) -> in
         grid = gaussians.attr_as_grid_img(name)
         height, width = int(grid.shape[0]), int(grid.shape[1])
         chw = grid.reshape(height, width, -1).permute(2, 0, 1).detach().float().cpu()
+        if name == "_rotation" and bool(config.get("canonicalize_rotation_sign", True)):
+            chw = _canonicalize_quaternion_chw(chw)
+            print("[rotation] canonicalized q/-q sign using the largest-magnitude component")
         _stats(f"attr_as_grid_img/{name}", chw)
         _grid_continuity(name, chw)
-        normalised, minimum, scale = _normalise_chw(chw)
+        attr_tail_fraction = tail_fraction if name in tail_attributes else 0.0
+        normalised, minimum, scale, clipped, tail_indices, tail_values = (
+            _normalise_chw_with_sparse_tails(chw, attr_tail_fraction)
+        )
         _stats(f"normalization/{name}", normalised)
         _stats(f"normalization_min/{name}", minimum)
         _stats(f"normalization_scale/{name}", scale)
-        _compare(f"normalization_roundtrip/{name}", normalised * scale + minimum, chw)
+        _compare(f"normalization_core_roundtrip/{name}", normalised * scale + minimum, clipped)
+        tail_key = f"attr_{len(layout)}"
+        # Store absolute original values, not original-minus-clipped residuals.
+        # Adding a source residual assumes the neural decoder reproduced the
+        # clipped boundary exactly; absolute overwrite remains correct even when
+        # the decoder is inaccurate at a tail location.
+        original_tail_values = chw.reshape(-1)[tail_indices]
+        stored_tail_values_np = original_tail_values.cpu().numpy().astype(tail_numpy_dtype)
+        stored_tail_values = torch.from_numpy(
+            stored_tail_values_np.astype(np.float32, copy=False)
+        ).to(chw.dtype)
+        sparse_tail_arrays[f"{tail_key}_indices"] = tail_indices.cpu().numpy().astype(np.uint32)
+        sparse_tail_arrays[f"{tail_key}_residuals"] = stored_tail_values_np
+        restored_with_tail = (normalised * scale + minimum).reshape(-1)
+        if tail_indices.numel():
+            restored_with_tail = restored_with_tail.clone()
+            restored_with_tail[tail_indices] = stored_tail_values
+        _compare(
+            f"normalization_plus_sparse_tail_roundtrip/{name}",
+            restored_with_tail.reshape_as(chw), chw,
+        )
+        print(
+            f"[tail:{name}] fraction_each_side={attr_tail_fraction:.6g} "
+            f"elements={tail_indices.numel()}/{chw.numel()} "
+            f"ratio={tail_indices.numel() / max(chw.numel(), 1):.6%} "
+            f"residual_dtype={tail_dtype_name}"
+        )
         debug_original_grids[name] = chw
 
         channels = int(chw.shape[0])
@@ -212,6 +400,11 @@ def compress_gaussians(gaussians, out_dir: str | os.PathLike, config=None) -> in
             "tensor_tail_shape": original_shape,
             "minimum": minimum.flatten().tolist(),
             "scale": scale.flatten().tolist(),
+            "tail_key": tail_key,
+            "tail_count": int(tail_indices.numel()),
+            "tail_fraction_each_side": attr_tail_fraction,
+            "tail_residual_dtype": tail_dtype_name,
+            "tail_storage": "absolute_values_v1",
         }
         channel_offset += channels
         normalised_images.append(normalised)
@@ -222,14 +415,20 @@ def compress_gaussians(gaussians, out_dir: str | os.PathLike, config=None) -> in
     reference = torch.cat(normalised_images, dim=0)
     _stats("reference_texture", reference)
     metadata = {
-        "format_version": 1,
+        "format_version": 2,
         "height": int(reference.shape[1]),
         "width": int(reference.shape[2]),
         "channels": int(reference.shape[0]),
         "attributes": layout,
+        "sparse_tail_file": "tail_residuals.npz",
     }
     (out_dir / "gaussian_layout.json").write_text(
         json.dumps(metadata, indent=2), encoding="utf-8"
+    )
+    np.savez_compressed(out_dir / "tail_residuals.npz", **sparse_tail_arrays)
+    print(
+        "[tail] sparse residual file: "
+        f"{(out_dir / 'tail_residuals.npz').stat().st_size / 1024**2:.3f} MiB"
     )
 
 
@@ -286,10 +485,18 @@ def compress_gaussians(gaussians, out_dir: str | os.PathLike, config=None) -> in
     config["channel_scale"] = channel_scale
 
     # 训练神经纹理模型
-    train_from_tensor(
+    model, _history = train_from_tensor(
         reference,
         out_dir,
         config,
+    )
+    _save_prediction_error_corrections(
+        model, reference, debug_original_grids, layout, out_dir, config
+    )
+    metadata["prediction_correction_file"] = "prediction_corrections.npz"
+    metadata["prediction_correction_storage"] = "absolute_vectors_v1"
+    (out_dir / "gaussian_layout.json").write_text(
+        json.dumps(metadata, indent=2), encoding="utf-8"
     )
 
     # debug_reference.pt 已在 _directory_size() 中排除
@@ -317,6 +524,9 @@ def _load_model(checkpoint_path: Path, device: torch.device):
         "latent_mips",
         "out_channels",
         "hidden_dim",
+        "scaling_decoder_hidden_dim",
+        "features_rest_decoder_hidden_dim",
+        "separate_gaussian_decoders",
         "ref_base_res",
         "max_lod",
     }
@@ -325,6 +535,13 @@ def _load_model(checkpoint_path: Path, device: torch.device):
         for key, value in checkpoint["config"].items()
         if key in valid_keys
     }
+    if "separate_gaussian_decoders" not in model_config:
+        # Checkpoints produced before the split-decoder patch contain only the
+        # old `decoder.*` keys and must retain the old architecture.
+        model_config["separate_gaussian_decoders"] = any(
+            key.startswith("features_rest_decoder.")
+            for key in checkpoint["model_state_dict"]
+        )
     model = NeuralMaterialCompressionModel(**model_config).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.set_freeze_bc_features(True)
@@ -383,6 +600,8 @@ def decompress_gaussians(out_dir: str | os.PathLike, config=None) -> Dict[str, n
 
     debug_reference = None
     debug_original_grids = None
+    tail_archive = None
+    correction_archive = None
 
     if debug_reference_path.exists():
         debug_reference = torch.load(
@@ -426,6 +645,16 @@ def decompress_gaussians(out_dir: str | os.PathLike, config=None) -> Dict[str, n
     original_grids_path = out_dir / "debug_original_grids.pt"
     if original_grids_path.exists():
         debug_original_grids = torch.load(original_grids_path, map_location="cpu")
+    tail_path = out_dir / "tail_residuals.npz"
+    if tail_path.exists():
+        tail_archive = np.load(tail_path, allow_pickle=False)
+        print(f"[tail] loaded sparse residuals: {tail_path}")
+    correction_path = out_dir / metadata.get(
+        "prediction_correction_file", "prediction_corrections.npz"
+    )
+    if correction_path.exists():
+        correction_archive = np.load(correction_path, allow_pickle=False)
+        print(f"[prediction-correction] loaded: {correction_path}")
 
     result = {}
 
@@ -578,9 +807,14 @@ def decompress_gaussians(out_dir: str | os.PathLike, config=None) -> Dict[str, n
         # -------------------------------------------------
         # 将预测值限制到训练目标范围
         # -------------------------------------------------
-        value = value_raw.clamp(
-            0.0,
-            1.0,
+        # Component-wise clamp changes quaternion direction. Rotation is
+        # denormalized first and projected to the unit sphere below.
+        value = (
+            value_raw
+            if name == "_rotation" and not bool(
+                config.get("clamp_rotation_before_denormalization", False)
+            )
+            else value_raw.clamp(0.0, 1.0)
         )
         _stats(f"clamp/{name}", value)
         _compare(f"clamp_change/{name}", value, value_raw, peak=1.0)
@@ -610,6 +844,42 @@ def decompress_gaussians(out_dir: str | os.PathLike, config=None) -> Dict[str, n
             value * scale
             + minimum
         )
+        tail_key = info.get("tail_key")
+        tail_count = int(info.get("tail_count", 0))
+        if tail_archive is not None and tail_key and tail_count:
+            index_key = f"{tail_key}_indices"
+            value_key = f"{tail_key}_residuals"
+            indices = torch.from_numpy(tail_archive[index_key].astype(np.int64, copy=False))
+            stored_values = torch.from_numpy(
+                tail_archive[value_key].astype(np.float32, copy=False)
+            ).to(value.dtype)
+            value_flat = value.reshape(-1)
+            if info.get("tail_storage") == "absolute_values_v1":
+                value_flat[indices] = stored_values
+                action = "overwritten"
+            else:
+                # Backward compatibility with old archives containing
+                # original-minus-clipped residuals.
+                value_flat[indices] += stored_values
+                action = "residual-added (legacy)"
+            print(
+                f"[tail:{name}] {action}={indices.numel()} elements "
+                f"stored_abs_max={stored_values.abs().max().item():.7g}"
+            )
+        correction_key = info.get("prediction_correction_key")
+        correction_count = int(info.get("prediction_correction_count", 0))
+        if correction_archive is not None and correction_key and correction_count:
+            indices = torch.from_numpy(
+                correction_archive[f"{correction_key}_indices"].astype(np.int64, copy=False)
+            )
+            vectors = torch.from_numpy(
+                correction_archive[f"{correction_key}_values"].astype(np.float32, copy=False)
+            ).to(value.dtype)
+            # Archive layout is [K,C], while the texture view is [C,H*W].
+            value.reshape(value.shape[0], -1)[:, indices] = vectors.T
+            print(
+                f"[prediction-correction:{name}] overwritten={indices.numel()} vectors"
+            )
         _stats(f"denormalization/{name}", value)
         if debug_original_grids is not None and name in debug_original_grids:
             _compare(f"denormalized_vs_original_grid/{name}", value, debug_original_grids[name])
@@ -705,19 +975,8 @@ def decompress_gaussians(out_dir: str | os.PathLike, config=None) -> Dict[str, n
             f"psnr={overall_psnr:.2f} dB"
         )
 
+    if tail_archive is not None:
+        tail_archive.close()
+    if correction_archive is not None:
+        correction_archive.close()
     return result
-    # result = {}
-    # for name, info in metadata["attributes"].items():
-    #     value = decoded[info["start"] : info["end"]]
-    #     minimum = torch.tensor(info["minimum"]).reshape(-1, 1, 1)
-    #     scale = torch.tensor(info["scale"]).reshape(-1, 1, 1)
-    #     value = value * scale + minimum
-    #     hwc = value.permute(1, 2, 0).contiguous().numpy()
-
-    #     if name == "_rotation":
-    #         norm = np.linalg.norm(hwc, axis=-1, keepdims=True)
-    #         hwc = hwc / np.clip(norm, 1e-8, None)
-
-    #     result[name] = hwc
-
-    # return result

@@ -213,6 +213,14 @@ def sample_texture_chw(tex_chw: torch.Tensor, uv: torch.Tensor, mode: str) -> to
     )
     return out.squeeze(0).squeeze(-1).transpose(0, 1)
 
+
+def sample_discrete_texels(tex_chw: torch.Tensor, uv: torch.Tensor) -> torch.Tensor:
+    """Exact lookup for record-like Gaussian textures at texel-centre UVs."""
+    height, width = int(tex_chw.shape[1]), int(tex_chw.shape[2])
+    x = torch.floor(uv[:, 0] * width).long().clamp_(0, width - 1)
+    y = torch.floor(uv[:, 1] * height).long().clamp_(0, height - 1)
+    return tex_chw[:, y, x].T.contiguous()
+
 #三线性采样
 def sample_mips_trilinear(
     mips: Sequence[torch.Tensor], uv: torch.Tensor, lod: torch.Tensor, bilinear_mode: str
@@ -238,7 +246,15 @@ def random_uv_lod(batch: int, max_lod: float, device: torch.device) -> Tuple[tor
     return uv, lod
 
 
-def generate_crop_batch_correct(ref_base_res, max_lod, num_crops=1, crop_size=512, device="cuda"):
+def generate_crop_batch_correct(
+    ref_base_res,
+    max_lod,
+    num_crops=1,
+    crop_size=512,
+    device="cuda",
+    uniform_sample_ratio=0.5,
+    texel_center_sampling=False,
+):
     """Generate ``num_crops`` independently jittered crops.
 
     A crop is placed on the reference pixel grid instead of always spanning the
@@ -254,14 +270,38 @@ def generate_crop_batch_correct(ref_base_res, max_lod, num_crops=1, crop_size=51
         max_origin = max(0, int(ref_base_res) - side)
         x0 = torch.randint(max_origin + 1, (), device=device) if max_origin else 0
         y0 = torch.randint(max_origin + 1, (), device=device) if max_origin else 0
-        jitter = torch.rand(2, device=device)
+        jitter = (
+            torch.full((2,), 0.5, device=device)
+            if texel_center_sampling else torch.rand(2, device=device)
+        )
         u = (xx + x0 + jitter[0]) / float(ref_base_res)
         v = (yy + y0 + jitter[1]) / float(ref_base_res)
         all_uv.append(torch.stack((u.reshape(-1), v.reshape(-1)), dim=1))
         r = torch.rand((), device=device)
         sampled_lod = (r if torch.rand((), device=device) < 0.05 else r.pow(4)) * max_lod
         all_lod.append(sampled_lod.expand(side * side))
-    return torch.cat(all_uv, dim=0), torch.cat(all_lod, dim=0)
+    uv = torch.cat(all_uv, dim=0)
+    lod = torch.cat(all_lod, dim=0)
+
+    # Uniform crop origins dramatically oversample central pixels: an edge pixel
+    # belongs to only one origin while a central pixel belongs to ~crop_size
+    # origins. Replace a configurable fraction with globally uniform pixel
+    # samples so borders/corners receive equal training probability.
+    ratio = float(uniform_sample_ratio)
+    if not 0.0 <= ratio <= 1.0:
+        raise ValueError(f"uniform_sample_ratio must be in [0,1], got {ratio}")
+    uniform_count = int(round(uv.shape[0] * ratio))
+    if uniform_count:
+        pixel_xy = torch.randint(
+            int(ref_base_res), (uniform_count, 2), device=device
+        )
+        jitter = (
+            torch.full((uniform_count, 2), 0.5, device=device)
+            if texel_center_sampling
+            else torch.rand(uniform_count, 2, device=device)
+        )
+        uv[:uniform_count] = (pixel_xy.float() + jitter) / float(ref_base_res)
+    return uv, lod
 
 class BC1SurrogateBlockLevel(nn.Module):
     """
@@ -528,6 +568,9 @@ class NeuralMaterialCompressionModel(nn.Module):
         hidden_dim: int,
         ref_base_res: int,
         max_lod: float,
+        scaling_decoder_hidden_dim: int = 64,
+        features_rest_decoder_hidden_dim: int = 256,
+        separate_gaussian_decoders: bool = True,
     ):
         super().__init__()
         assert len(latent_resolutions) == len(latent_mips)
@@ -546,11 +589,25 @@ class NeuralMaterialCompressionModel(nn.Module):
             ]
         )
 
-        self.decoder = MaterialDecoderMLP(
-            in_dim=self.n_latent * 3 + 1,
-            hidden=hidden_dim,
-            out_dim=out_channels,
+        decoder_in_dim = self.n_latent * 3 + 1
+        self.out_channels = int(out_channels)
+        self.hidden_dim = int(hidden_dim)
+        self.scaling_decoder_hidden_dim = int(scaling_decoder_hidden_dim)
+        self.features_rest_decoder_hidden_dim = int(features_rest_decoder_hidden_dim)
+        self.separate_gaussian_decoders = bool(
+            separate_gaussian_decoders and out_channels == 59
         )
+        if self.separate_gaussian_decoders:
+            # Base output order: xyz(3), features_dc(3), rotation(4), opacity(1).
+            self.decoder = MaterialDecoderMLP(decoder_in_dim, hidden_dim, 11)
+            self.features_rest_decoder = MaterialDecoderMLP(
+                decoder_in_dim, features_rest_decoder_hidden_dim, 45
+            )
+            self.scaling_decoder = MaterialDecoderMLP(
+                decoder_in_dim, scaling_decoder_hidden_dim, 3
+            )
+        else:
+            self.decoder = MaterialDecoderMLP(decoder_in_dim, hidden_dim, out_channels)
 
         # lod bias b_i = log2(max(h_i/h, w_i/w))
         self.lod_biases = [math.log2(max(r / ref_base_res, r / ref_base_res)) for r in latent_resolutions]
@@ -573,6 +630,34 @@ class NeuralMaterialCompressionModel(nn.Module):
 
     def decoder_parameters(self):
         yield from self.decoder.parameters()
+        if self.separate_gaussian_decoders:
+            yield from self.features_rest_decoder.parameters()
+            yield from self.scaling_decoder.parameters()
+
+    def decoder_state_dicts(self):
+        states = {"base": self.decoder.state_dict()}
+        if self.separate_gaussian_decoders:
+            states["features_rest"] = self.features_rest_decoder.state_dict()
+            states["scaling"] = self.scaling_decoder.state_dict()
+        return states
+
+    def load_decoder_state_dicts(self, states):
+        self.decoder.load_state_dict(states["base"])
+        if self.separate_gaussian_decoders:
+            self.features_rest_decoder.load_state_dict(states["features_rest"])
+            self.scaling_decoder.load_state_dict(states["scaling"])
+
+    def _decode_latent_input(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.separate_gaussian_decoders:
+            return self.decoder(x)
+        base = self.decoder(x)
+        features_rest = self.features_rest_decoder(x)
+        scaling = self.scaling_decoder(x)
+        # Restore the canonical 59-channel Gaussian layout.
+        return torch.cat(
+            (base[:, 0:6], features_rest, scaling, base[:, 6:10], base[:, 10:11]),
+            dim=1,
+        )
 
 
     def _collect_latents_bc(self, uv: torch.Tensor, lod: torch.Tensor, use_uv_shift: bool = False) -> torch.Tensor:
@@ -594,7 +679,7 @@ class NeuralMaterialCompressionModel(nn.Module):
         # 归一化 LOD 到 [0,1]
         lod_norm = (lod / max(float(self.max_lod), EPS)).unsqueeze(1)  # [B, 1]
         x = torch.cat([x, lod_norm], dim=1)  # [B, n_latent*3+1]
-        out = self.decoder(x)
+        out = self._decode_latent_input(x)
         # 反标准化（仅在推理时）
         if not self.training and hasattr(self, 'channel_mean'):
             out = out * self.channel_std + self.channel_mean
@@ -627,7 +712,7 @@ class TrainConfig:
     batch_size: int = 4096 
     phase1_iters: int = 5_000
     phase2_iters: int = 50_000
-    phase3_iters: int = 3_000
+    phase3_iters: int = 1_000
 
     lr_feat_phase1: float = 5e-2
     lr_mlp_phase1: float = 1e-3
@@ -637,19 +722,35 @@ class TrainConfig:
     lr_mlp_phase2: float = 1e-3
     gamma_phase2: float = 0.99994
 
-    lr_mlp_phase3: float = 5e-4
+    lr_mlp_phase3: float = 1e-4
 
     log_every: int = 200
     debug_every: int = 2000
     interactive_progress: bool = False
     num_crops: int = 1
     crop_size: int = 256
+    uniform_sample_ratio: float = 1.0
+    gaussian_texel_center_sampling: bool = True
     validation_res: int = 256
-    features_rest_weight: float = 3.0
-    scaling_raw_weight: float = 1.0
-    scaling_relative_weight: float = 0.1
+    full_validation_every: int = 5000
+    full_validation_chunk_size: int = 65536
+    full_validation_tile_size: int = 128
+    full_validation_worst_tiles: int = 10
+    full_validation_on_phase_end: bool = True
+    full_validation_worst_tile_weight: float = 0.25
+    full_validation_p99_weight: float = 0.10
+    full_validation_opacity_weighted: bool = True
+    features_rest_weight: float = 4.0
+    features_rest_mse_weight: float = 5.0
+    features_rest_variance_weight: float = 10.0
+    features_rest_energy_weight: float = 2.0
+    scaling_raw_weight: float = 2.0
+    scaling_relative_weight: float = 0.25
     xyz_raw_weight: float = 0.25
     rotation_angle_weight: float = 2.0
+    rotation_aligned_weight: float = 1.0
+    rotation_norm_weight: float = 0.5
+    phase3_validation_every: int = 100
 
     #新加
     lod0_only: bool = True
@@ -938,13 +1039,28 @@ def export_trained_artifacts(model: NeuralMaterialCompressionModel, out_dir: Pat
         raise NotImplementedError("BC1 only supports unsigned mode.")
 
     # --- Decoder weights ---
-    state = model.decoder.state_dict()
-    torch.save(state, meta_dir / "decoder_state.pt")
-    flat = []
-    for k in ("fc1.weight", "fc1.bias", "fc2.weight", "fc2.bias", "fc3.weight", "fc3.bias"):
-        flat.append(state[k].detach().to(torch.float16).contiguous().view(-1))
-    fp16_blob = torch.cat(flat).cpu().numpy().tobytes()
-    (out_dir / "decoder_fp16.bin").write_bytes(fp16_blob)
+    decoder_modules = {"base": model.decoder}
+    if model.separate_gaussian_decoders:
+        decoder_modules["features_rest"] = model.features_rest_decoder
+        decoder_modules["scaling"] = model.scaling_decoder
+    decoder_meta = {}
+    for branch, module in decoder_modules.items():
+        state = module.state_dict()
+        state_name = "decoder_state.pt" if branch == "base" else f"decoder_{branch}_state.pt"
+        blob_name = "decoder_fp16.bin" if branch == "base" else f"decoder_{branch}_fp16.bin"
+        torch.save(state, meta_dir / state_name)
+        flat = []
+        for k in ("fc1.weight", "fc1.bias", "fc2.weight", "fc2.bias", "fc3.weight", "fc3.bias"):
+            flat.append(state[k].detach().to(torch.float16).contiguous().view(-1))
+        (out_dir / blob_name).write_bytes(torch.cat(flat).cpu().numpy().tobytes())
+        decoder_meta[branch] = {
+            "in_dim": int(module.fc1.in_features),
+            "hidden_dim": int(module.fc1.out_features),
+            "out_dim": int(module.fc3.out_features),
+            "weights_fp16_blob": blob_name,
+            "state_dict": f"metadata/{state_name}",
+            "mlp_structure": "fc1→fc2→fc3",
+        }
 
     # --- Latent DDS (BC1 from block params) + PNG previews ---
     latent_files = []
@@ -988,7 +1104,7 @@ def export_trained_artifacts(model: NeuralMaterialCompressionModel, out_dir: Pat
         print(f"[export] BC1 latent {i:02d}: {W0}×{H0} → {dds_path.name}")
 
     meta = {
-        "version": 4,
+        "version": 5,
         "latent_count": model.n_latent,
         "latent_resolutions": model.latent_resolutions,
         "lod_biases": model.lod_biases,
@@ -996,14 +1112,13 @@ def export_trained_artifacts(model: NeuralMaterialCompressionModel, out_dir: Pat
         "bc_mode": 0,
         "endpoint_bits": 16,
         "index_bits": 2,
-        "decoder": {
-            "in_dim": int(model.decoder.fc1.in_features),
-            "hidden_dim": int(model.decoder.fc1.out_features),
-            "out_dim": int(model.decoder.fc3.out_features) if hasattr(model.decoder, 'fc3') else int(model.decoder.fc2.out_features),
-            "weights_fp16_blob": "decoder_fp16.bin",
-            "state_dict": "metadata/decoder_state.pt",
-            "mlp_structure": "fc1→fc2→fc3" if hasattr(model.decoder, 'fc3') else "fc1→fc2",
-        },
+        "decoder_layout": "gaussian_split_v1" if model.separate_gaussian_decoders else "single",
+        "decoders": decoder_meta,
+        "decoder_output_mapping": {
+            "base": ["xyz:0:3", "features_dc:3:6", "rotation:54:58", "opacity:58:59"],
+            "features_rest": ["features_rest:6:51"],
+            "scaling": ["scaling:51:54"],
+        } if model.separate_gaussian_decoders else {"base": [f"all:0:{model.out_channels}"]},
         "latent_files": latent_files,
         "channel_mean": model.channel_mean.cpu().tolist(),
         "channel_std": model.channel_std.cpu().tolist(),
@@ -1024,16 +1139,10 @@ def _save_checkpoint(model, history, phase, iter, export_dir=None):
         export_dir: 导出目录（如果提供）
     """
 
-    # 检测MLP结构（自动适配单层/双层）
     state_dict = model.decoder.state_dict()
     has_fc3 = 'fc3.weight' in state_dict
-
-    if has_fc3:
-        out_channels = model.decoder.fc3.out_features
-        hidden_dim = model.decoder.fc1.out_features
-    else:
-        out_channels = model.decoder.fc2.out_features
-        hidden_dim = model.decoder.fc1.out_features
+    out_channels = model.out_channels
+    hidden_dim = model.hidden_dim
 
     # 构建checkpoint数据
     checkpoint = {
@@ -1047,6 +1156,9 @@ def _save_checkpoint(model, history, phase, iter, export_dir=None):
             'latent_mips': [p.num_mips for p in model.bc_pyramids],
             'out_channels': out_channels,
             'hidden_dim': hidden_dim,
+            'scaling_decoder_hidden_dim': model.scaling_decoder_hidden_dim,
+            'features_rest_decoder_hidden_dim': model.features_rest_decoder_hidden_dim,
+            'separate_gaussian_decoders': model.separate_gaussian_decoders,
             'ref_base_res': model.ref_base_res,
             'n_latent': model.n_latent,
             'lod_biases': model.lod_biases,
@@ -1109,7 +1221,10 @@ def gaussian_attribute_loss(
         "xyz": 20.0, "features_dc": 5.0,
         "features_rest": cfg.features_rest_weight,
         # Raw-domain terms below carry most scaling/rotation supervision.
-        "scaling": 2.0, "rotation": 1.0, "opacity": 10.0,
+        # Do not use ordinary component L1 for rotation here: q and -q are
+        # equivalent, and it conflicts with an angle-only objective. Rotation
+        # is supervised below with sign alignment plus an explicit norm term.
+        "scaling": 2.0, "rotation": 0.0, "opacity": 10.0,
     }
     loss = sum(
         weights[name] * F.l1_loss(
@@ -1136,11 +1251,37 @@ def gaussian_attribute_loss(
     scale_ratio = torch.exp(scaling_delta.clamp(-5.0, 5.0))
     scaling_relative_loss = F.smooth_l1_loss(scale_ratio, torch.ones_like(scale_ratio))
 
+    pred_rest, target_rest = pred[:, 6:51], target[:, 6:51]
+    features_rest_mse = F.mse_loss(pred_rest, target_rest)
+    # Direct L1 is intentional: Smooth-L1 becomes quadratic for the relatively
+    # small std gap and was numerically too weak to prevent variance collapse.
+    features_rest_variance = (
+        pred_rest.std(dim=0, unbiased=False)
+        - target_rest.std(dim=0, unbiased=False)
+    ).abs().mean()
+    features_rest_energy = (
+        pred_rest.square().mean(dim=0).sqrt()
+        - target_rest.square().mean(dim=0).sqrt()
+    ).abs().mean()
+
     # q and -q represent the same rotation. Normalize both sides and optimize
     # their geodesic angular distance rather than component-wise L1 alone.
-    q_pred = F.normalize(pred_raw[:, 54:58], dim=1, eps=EPS)
-    q_target = F.normalize(target_raw[:, 54:58], dim=1, eps=EPS)
-    dot = (q_pred * q_target).sum(dim=1).abs().clamp(0.0, 1.0 - 1e-7)
+    q_pred_raw = pred_raw[:, 54:58]
+    q_target_raw = target_raw[:, 54:58]
+    q_pred = F.normalize(q_pred_raw, dim=1, eps=EPS)
+    q_target = F.normalize(q_target_raw, dim=1, eps=EPS)
+    signed_dot = (q_pred * q_target).sum(dim=1, keepdim=True)
+    # Align the predicted sign to the target before comparing components.
+    # detach() keeps this discrete choice out of the gradient graph.
+    sign = torch.where(signed_dot.detach() < 0.0, -1.0, 1.0)
+    q_pred_aligned = q_pred * sign
+    rotation_aligned = F.smooth_l1_loss(q_pred_aligned, q_target)
+    # Angular loss alone is invariant to |q| and allowed the decoder output to
+    # collapse close to zero. Keep raw decoded quaternions near unit length.
+    rotation_norm = F.smooth_l1_loss(
+        q_pred_raw.norm(dim=1), torch.ones_like(q_pred_raw[:, 0])
+    )
+    dot = signed_dot.abs().squeeze(1).clamp(0.0, 1.0 - 1e-7)
     rotation_angle = (2.0 * torch.acos(dot)).mean()
 
     return (
@@ -1148,7 +1289,12 @@ def gaussian_attribute_loss(
         + cfg.xyz_raw_weight * (xyz_loss + 0.1 * xyz_tail)
         + cfg.scaling_raw_weight * scaling_log_loss
         + cfg.scaling_relative_weight * scaling_relative_loss
+        + cfg.features_rest_mse_weight * features_rest_mse
+        + cfg.features_rest_variance_weight * features_rest_variance
+        + cfg.features_rest_energy_weight * features_rest_energy
         + cfg.rotation_angle_weight * rotation_angle
+        + cfg.rotation_aligned_weight * rotation_aligned
+        + cfg.rotation_norm_weight * rotation_norm
     )
 
 
@@ -1171,11 +1317,16 @@ def debug_error_quantiles(stage: str, pred: torch.Tensor, target: torch.Tensor) 
 @torch.no_grad()
 def debug_fixed_validation(model, ref_base, raw_minimum, raw_scale, cfg, stage: str) -> None:
     res = min(int(cfg.validation_res), int(ref_base.shape[-1]))
-    axis = (torch.arange(res, device=ref_base.device).float() + 0.5) / res
-    yy, xx = torch.meshgrid(axis, axis, indexing="ij")
-    uv = torch.stack((xx.reshape(-1), yy.reshape(-1)), dim=1)
+    height, width = int(ref_base.shape[1]), int(ref_base.shape[2])
+    y_idx = torch.linspace(0, height - 1, res, device=ref_base.device).round().long()
+    x_idx = torch.linspace(0, width - 1, res, device=ref_base.device).round().long()
+    yy, xx = torch.meshgrid(y_idx, x_idx, indexing="ij")
+    uv = torch.stack(
+        ((xx.reshape(-1).float() + 0.5) / width,
+         (yy.reshape(-1).float() + 0.5) / height), dim=1
+    )
     lod = torch.zeros(uv.shape[0], device=uv.device)
-    target = sample_texture_chw(ref_base, uv, mode="bilinear")
+    target = ref_base[:, yy.reshape(-1), xx.reshape(-1)].T.contiguous()
     pred = model.forward_bc(uv, lod)
     debug_gaussian_batch(f"{stage}/fixed_global_{res}x{res}", pred, target)
     debug_error_quantiles(f"{stage}/normalized", pred, target)
@@ -1191,17 +1342,198 @@ def debug_fixed_validation(model, ref_base, raw_minimum, raw_scale, cfg, stage: 
 
 
 @torch.no_grad()
+def fixed_validation_mse(model, ref_base: torch.Tensor, resolution: int) -> float:
+    """Deterministic global metric used to select the best Phase-3 decoder."""
+    res = min(int(resolution), int(ref_base.shape[-1]))
+    height, width = int(ref_base.shape[1]), int(ref_base.shape[2])
+    y_idx = torch.linspace(0, height - 1, res, device=ref_base.device).round().long()
+    x_idx = torch.linspace(0, width - 1, res, device=ref_base.device).round().long()
+    yy, xx = torch.meshgrid(y_idx, x_idx, indexing="ij")
+    uv = torch.stack(
+        ((xx.reshape(-1).float() + 0.5) / width,
+         (yy.reshape(-1).float() + 0.5) / height), dim=1
+    )
+    lod = torch.zeros(uv.shape[0], device=uv.device)
+    target = ref_base[:, yy.reshape(-1), xx.reshape(-1)].T.contiguous()
+    pred = model.forward_bc(uv, lod)
+    return float(F.mse_loss(pred, target).item())
+
+
+@torch.no_grad()
+def full_grid_validation(
+    model, ref_base: torch.Tensor, raw_minimum: torch.Tensor,
+    raw_scale: torch.Tensor, cfg: TrainConfig, stage: str,
+) -> dict:
+    """Decode every texel in bounded chunks and report tail/spatial metrics."""
+    device = ref_base.device
+    channels, height, width = ref_base.shape
+    total = height * width
+    chunk = max(1, int(cfg.full_validation_chunk_size))
+    tile = max(1, int(cfg.full_validation_tile_size))
+    tiles_x = (width + tile - 1) // tile
+    tiles_y = (height + tile - 1) // tile
+    tile_sse = torch.zeros(tiles_x * tiles_y, dtype=torch.float64)
+    tile_count = torch.zeros(tiles_x * tiles_y, dtype=torch.int64)
+    attr_errors = {
+        name: torch.empty(total, dtype=torch.float32)
+        for name, begin, end in GAUSSIAN_CHANNELS if channels >= end
+    }
+    pixel_errors = torch.empty(total, dtype=torch.float32)
+    rotation_angles = torch.empty(total, dtype=torch.float32) if channels >= 58 else None
+    pred_sum = torch.zeros(channels, dtype=torch.float64)
+    pred_sq_sum = torch.zeros(channels, dtype=torch.float64)
+    target_sum = torch.zeros(channels, dtype=torch.float64)
+    target_sq_sum = torch.zeros(channels, dtype=torch.float64)
+    total_sse = 0.0
+    weighted_sse = {"xyz": 0.0, "scaling": 0.0, "rotation": 0.0}
+    weighted_den = 0.0
+    was_training = model.training
+    model.eval()
+
+    ref_flat = ref_base.reshape(channels, -1)
+    for begin_index in range(0, total, chunk):
+        end_index = min(total, begin_index + chunk)
+        flat = torch.arange(begin_index, end_index, device=device)
+        y = torch.div(flat, width, rounding_mode="floor")
+        x = flat - y * width
+        uv = torch.stack(((x.float() + 0.5) / width, (y.float() + 0.5) / height), 1)
+        lod = torch.zeros(end_index - begin_index, device=device)
+        pred = model.forward_bc(uv, lod)
+        target = ref_flat[:, begin_index:end_index].T
+        delta = pred - target
+        sq = delta.square()
+        pred_cpu, target_cpu = pred.double().cpu(), target.double().cpu()
+        pred_sum += pred_cpu.sum(0)
+        pred_sq_sum += pred_cpu.square().sum(0)
+        target_sum += target_cpu.sum(0)
+        target_sq_sum += target_cpu.square().sum(0)
+
+        pred_raw = pred * raw_scale + raw_minimum
+        target_raw = target * raw_scale + raw_minimum
+        for name, attr_begin, attr_end in GAUSSIAN_CHANNELS:
+            if channels < attr_end:
+                continue
+            err = (pred_raw[:, attr_begin:attr_end] - target_raw[:, attr_begin:attr_end])
+            attr_errors[name][begin_index:end_index] = err.square().mean(1).sqrt().cpu()
+
+        if channels >= 58:
+            qp = F.normalize(pred_raw[:, 54:58], dim=1, eps=EPS)
+            qt = F.normalize(target_raw[:, 54:58], dim=1, eps=EPS)
+            angle = 2.0 * torch.acos((qp * qt).sum(1).abs().clamp(0, 1 - 1e-7))
+            rotation_angles[begin_index:end_index] = (angle * 180.0 / math.pi).cpu()
+            # q and -q encode the same rotation. Replace ordinary encoded
+            # component MSE in checkpoint scoring with sign-invariant unit-q
+            # chordal error, while preserving four-channel weighting.
+            q_mse = torch.minimum(
+                (qp - qt).square().mean(1), (qp + qt).square().mean(1)
+            )
+            semantic_sq_sum = sq.sum(1) - sq[:, 54:58].sum(1) + 4.0 * q_mse
+        else:
+            semantic_sq_sum = sq.sum(1)
+        per_pixel = semantic_sq_sum / channels
+        pixel_errors[begin_index:end_index] = per_pixel.sqrt().cpu()
+        total_sse += float(semantic_sq_sum.double().sum().item())
+        tile_ids = ((y // tile) * tiles_x + (x // tile)).cpu()
+        tile_sse += torch.bincount(
+            tile_ids, weights=per_pixel.double().cpu(), minlength=tile_sse.numel()
+        )
+        tile_count += torch.bincount(tile_ids, minlength=tile_count.numel())
+        if cfg.full_validation_opacity_weighted and channels >= 59:
+            visibility = torch.sigmoid(target_raw[:, 58]).double()
+            weighted_den += float(visibility.sum().item())
+            weighted_sse["xyz"] += float(
+                (visibility * (pred_raw[:, 0:3] - target_raw[:, 0:3]).square().mean(1).double()).sum().item()
+            )
+            weighted_sse["scaling"] += float(
+                (visibility * (pred_raw[:, 51:54] - target_raw[:, 51:54]).square().mean(1).double()).sum().item()
+            )
+            weighted_sse["rotation"] += float(
+                (visibility * angle.double().square()).sum().item()
+            )
+
+    global_mse = total_sse / max(total * channels, 1)
+    global_rmse = math.sqrt(global_mse)
+    global_psnr = -20.0 * math.log10(max(global_rmse, 1e-12))
+    tile_mse = tile_sse / tile_count.clamp_min(1)
+    worst_count = min(max(1, int(cfg.full_validation_worst_tiles)), tile_mse.numel())
+    worst_values, worst_ids = torch.topk(tile_mse, worst_count)
+    p99 = float(torch.quantile(pixel_errors, 0.99).item())
+    score = (
+        global_rmse
+        + float(cfg.full_validation_worst_tile_weight) * math.sqrt(float(worst_values[0]))
+        + float(cfg.full_validation_p99_weight) * p99
+    )
+    print(
+        f"[full-validation:{stage}] grid={height}x{width} rmse={global_rmse:.7g} "
+        f"psnr={global_psnr:.3f}dB p99={p99:.7g} score={score:.7g}"
+    )
+    for rank, (value, tile_id) in enumerate(zip(worst_values, worst_ids), 1):
+        ty, tx = divmod(int(tile_id), tiles_x)
+        print(
+            f"[full-validation:{stage}/worst-tile-{rank}] x={tx * tile} y={ty * tile} "
+            f"size={tile} rmse={math.sqrt(float(value)):.7g}"
+        )
+    qs_tensor = torch.tensor([.5, .95, .99, .999])
+    for name, errors in attr_errors.items():
+        qs = torch.quantile(errors, qs_tensor)
+        print(
+            f"[full-quantile:{stage}/{name}] p50={qs[0]:.6g} p95={qs[1]:.6g} "
+            f"p99={qs[2]:.6g} p99.9={qs[3]:.6g} max={errors.max():.6g}"
+        )
+    if rotation_angles is not None:
+        qs = torch.quantile(rotation_angles, qs_tensor)
+        print(
+            f"[full-rotation-angle:{stage}] p50={qs[0]:.3f}deg p95={qs[1]:.3f}deg "
+            f"p99={qs[2]:.3f}deg p99.9={qs[3]:.3f}deg max={rotation_angles.max():.3f}deg"
+        )
+    pred_var = (pred_sq_sum / total - (pred_sum / total).square()).clamp_min(0)
+    target_var = (target_sq_sum / total - (target_sum / total).square()).clamp_min(0)
+    for name, attr_begin, attr_end in GAUSSIAN_CHANNELS:
+        if channels >= attr_end:
+            ratio = pred_var[attr_begin:attr_end].sqrt().mean() / target_var[attr_begin:attr_end].sqrt().mean().clamp_min(1e-12)
+            print(f"[full-std-ratio:{stage}/{name}] pred_over_target={ratio.item():.6g}")
+    if weighted_den > 0.0:
+        print(
+            f"[full-opacity-weighted:{stage}] xyz_rmse={math.sqrt(weighted_sse['xyz']/weighted_den):.7g} "
+            f"scaling_rmse={math.sqrt(weighted_sse['scaling']/weighted_den):.7g} "
+            f"rotation_rms={math.sqrt(weighted_sse['rotation']/weighted_den)*180/math.pi:.3f}deg"
+        )
+    if was_training:
+        model.train()
+    return {"score": score, "mse": global_mse, "rmse": global_rmse, "psnr": global_psnr}
+
+
+@torch.no_grad()
 def debug_training_stage(model, uv, lod, target, pred, stage: str) -> None:
     latents = model._collect_latents_bc(uv, lod, use_uv_shift=False)
     lod_norm = (lod / max(float(model.max_lod), EPS)).unsqueeze(1)
     decoder_input = torch.cat((latents, lod_norm), dim=1)
-    decoder_raw = model.decoder(decoder_input)
+    decoder_raw = model._decode_latent_input(decoder_input)
     debug_tensor(f"{stage}/uv", uv)
+    texel_coord = uv * float(model.ref_base_res)
+    center_error = (texel_coord - torch.floor(texel_coord) - 0.5).abs()
+    print(
+        f"[debug:{stage}/texel_center_error] "
+        f"mean={center_error.mean().item():.7g} max={center_error.max().item():.7g}"
+    )
     debug_tensor(f"{stage}/lod", lod)
     debug_tensor(f"{stage}/bc1_latent_decode", latents)
     debug_tensor(f"{stage}/decoder_input", decoder_input)
     debug_compare(f"{stage}/forward_vs_decoder_raw", pred, decoder_raw)
     debug_gaussian_batch(f"{stage}/decoder_output", pred, target)
+    if pred.shape[1] >= 51:
+        pr, tr = pred[:, 6:51], target[:, 6:51]
+        mse = F.mse_loss(pr, tr)
+        std_l1 = (pr.std(0, unbiased=False) - tr.std(0, unbiased=False)).abs().mean()
+        energy_l1 = (
+            pr.square().mean(0).sqrt() - tr.square().mean(0).sqrt()
+        ).abs().mean()
+        ratio = pr.std(0, unbiased=False).mean() / tr.std(0, unbiased=False).mean().clamp_min(EPS)
+        print(
+            f"[features-rest-objective:{stage}] mse={mse.item():.7g} "
+            f"std_l1={std_l1.item():.7g} energy_l1={energy_l1.item():.7g} "
+            f"std_ratio={ratio.item():.6g}"
+        )
 
 
 def train(model: NeuralMaterialCompressionModel, ref_mips: List[torch.Tensor], cfg: TrainConfig) -> List[dict]:
@@ -1319,19 +1651,34 @@ def train(model: NeuralMaterialCompressionModel, ref_mips: List[torch.Tensor], c
     pbar2 = tqdm(phase2_iter, desc="phase2", dynamic_ncols=True) if cfg.interactive_progress else None
     for it in (pbar2 or phase2_iter):
 
-        uv, lod = generate_crop_batch_correct(ref_base_res=ref_base_res, max_lod=max_lod, num_crops=cfg.num_crops,
-                                              crop_size=cfg.crop_size, device=device)
+        uv, lod = generate_crop_batch_correct(
+            ref_base_res=ref_base_res, max_lod=max_lod, num_crops=cfg.num_crops,
+            crop_size=cfg.crop_size, device=device,
+            uniform_sample_ratio=cfg.uniform_sample_ratio,
+            texel_center_sampling=cfg.gaussian_texel_center_sampling,
+        )
 
         #新加
         if cfg.lod0_only:
             lod.zero_()
 
-        target = sample_mips_trilinear(ref_mips_norm, uv, lod, bilinear_mode="bilinear")
+        # A Gaussian grid is a table of discrete records, not a continuous
+        # material image. At LOD0, sub-pixel jitter would blend neighbouring
+        # Gaussians and train the model toward artificially smoothed targets.
+        target = (
+            sample_discrete_texels(ref_base, uv)
+            if cfg.lod0_only and cfg.gaussian_texel_center_sampling
+            else sample_mips_trilinear(ref_mips_norm, uv, lod, bilinear_mode="bilinear")
+        )
         pred = _fwd_bc(uv, lod)
 
         if it == 0 or it % max(1, cfg.debug_every) == 0 or it == cfg.phase2_iters - 1:
             debug_training_stage(model, uv, lod, target, pred, f"phase2/iter_{it}")
             debug_fixed_validation(
+                model, ref_base, raw_minimum, raw_scale, cfg, f"phase2/iter_{it}"
+            )
+        if cfg.full_validation_every > 0 and (it + 1) % cfg.full_validation_every == 0:
+            full_grid_validation(
                 model, ref_base, raw_minimum, raw_scale, cfg, f"phase2/iter_{it}"
             )
 
@@ -1361,6 +1708,11 @@ def train(model: NeuralMaterialCompressionModel, ref_mips: List[torch.Tensor], c
     if pbar2:
         pbar2.close()
 
+    if cfg.full_validation_on_phase_end:
+        full_grid_validation(
+            model, ref_base, raw_minimum, raw_scale, cfg, "phase2/end"
+        )
+
     print("[checkpoint] Phase 2 完成，保存中间状态...")
     _save_checkpoint(model, history, phase=2, iter=cfg.phase2_iters, export_dir=getattr(cfg, 'export_dir', None))
 
@@ -1368,18 +1720,37 @@ def train(model: NeuralMaterialCompressionModel, ref_mips: List[torch.Tensor], c
     if cfg.phase3_iters > 0:
         model.quantize_and_freeze_bc_features()
         opt3 = torch.optim.Adam(model.decoder_parameters(), lr=cfg.lr_mlp_phase3)
+        baseline_full = full_grid_validation(
+            model, ref_base, raw_minimum, raw_scale, cfg, "phase3/baseline"
+        )
+        best_phase3_score = baseline_full["score"]
+        best_decoder_state = {
+            group: {key: value.detach().cpu().clone() for key, value in state.items()}
+            for group, state in model.decoder_state_dicts().items()
+        }
+        best_phase3_iter = -1
+        print(f"[phase3-best] baseline full-grid score={best_phase3_score:.8g}")
         phase3_iter = range(cfg.phase3_iters)
         pbar3 = tqdm(phase3_iter, desc="phase3", dynamic_ncols=True) if cfg.interactive_progress else None
 
         for it in (pbar3 or phase3_iter):
-            uv, lod = generate_crop_batch_correct(ref_base_res=ref_base_res, max_lod=max_lod,num_crops=cfg.num_crops, crop_size=cfg.crop_size, device=device)
+            uv, lod = generate_crop_batch_correct(
+                ref_base_res=ref_base_res, max_lod=max_lod,
+                num_crops=cfg.num_crops, crop_size=cfg.crop_size, device=device,
+                uniform_sample_ratio=cfg.uniform_sample_ratio,
+                texel_center_sampling=cfg.gaussian_texel_center_sampling,
+            )
 
             #新加
             if cfg.lod0_only:
                 lod.zero_()
 
             # target = sample_mips_trilinear(ref_mips, uv, lod, bilinear_mode="bilinear")
-            target = sample_mips_trilinear(ref_mips_norm, uv, lod, bilinear_mode="bilinear")
+            target = (
+                sample_discrete_texels(ref_base, uv)
+                if cfg.lod0_only and cfg.gaussian_texel_center_sampling
+                else sample_mips_trilinear(ref_mips_norm, uv, lod, bilinear_mode="bilinear")
+            )
             pred = _fwd_bc(uv, lod)
 
             if it == 0 or it % max(1, cfg.debug_every) == 0 or it == cfg.phase3_iters - 1:
@@ -1400,11 +1771,36 @@ def train(model: NeuralMaterialCompressionModel, ref_mips: List[torch.Tensor], c
             loss.backward()
             opt3.step()
 
+            validate_now = (
+                (it + 1) % max(1, cfg.phase3_validation_every) == 0
+                or it == cfg.phase3_iters - 1
+            )
+            if validate_now:
+                validation = full_grid_validation(
+                    model, ref_base, raw_minimum, raw_scale, cfg,
+                    f"phase3/iter_{it}",
+                )
+                validation_score = validation["score"]
+                print(f"[phase3-validation] iter={it} full-grid score={validation_score:.8g}")
+                if validation_score < best_phase3_score:
+                    best_phase3_score = validation_score
+                    best_phase3_iter = it
+                    best_decoder_state = {
+                        group: {key: value.detach().cpu().clone() for key, value in state.items()}
+                        for group, state in model.decoder_state_dicts().items()
+                    }
+
             if pbar3 and (it % (cfg.log_every // 2) == 0 or it == cfg.phase3_iters - 1):
                 pbar3.set_postfix(l1=f"{loss.item():.4e}")
 
         if pbar3:
             pbar3.close()
+        model.load_decoder_state_dicts(best_decoder_state)
+        print(
+            f"[phase3-best] restored decoder from iter={best_phase3_iter} "
+            f"full-grid score={best_phase3_score:.8g} "
+            "(iter=-1 means the quantized Phase-2 baseline was best)"
+        )
 
     # === 最终checkpoint保存 ===
     print("[checkpoint] 训练完成，保存最终模型状态...")
@@ -1428,7 +1824,7 @@ def train_from_tensor(reference: torch.Tensor, export_dir: Path, config=None):
     # material input. Use six higher-resolution BC1 latents (18 sampled features)
     # by default instead of four low-resolution latents (12 features).
     latent_resolutions = list(config.get(
-        "latent_resolutions", [2048, 2048, 2048, 1024, 1024, 1024]
+        "latent_resolutions", [2048, 2048, 2048, 2048, 1024, 1024, 1024, 1024]
     ))
     latent_mips = list(config.get(
         "latent_mips", [int(math.log2(x)) + 1 for x in latent_resolutions]
@@ -1437,30 +1833,49 @@ def train_from_tensor(reference: torch.Tensor, export_dir: Path, config=None):
         latent_resolutions=latent_resolutions,
         latent_mips=latent_mips,
         out_channels=int(reference.shape[0]),
-        hidden_dim=int(config.get("hidden_dim", 128)),
+        hidden_dim=int(config.get("hidden_dim", 192)),
         ref_base_res=int(reference.shape[-1]),
         max_lod=float(len(ref_mips) - 1),
+        scaling_decoder_hidden_dim=int(config.get("scaling_decoder_hidden_dim", 64)),
+        features_rest_decoder_hidden_dim=int(config.get("features_rest_decoder_hidden_dim", 256)),
+        separate_gaussian_decoders=bool(config.get("separate_gaussian_decoders", True)),
     ).to(device)
     cfg = TrainConfig(
         device=str(device),
         batch_size=int(config.get("batch_size", 4096)),
         phase2_iters=int(config.get("phase2_iters", 50000)),
-        phase3_iters=int(config.get("phase3_iters", 3000)),
+        phase3_iters=int(config.get("phase3_iters", 1000)),
         lr_feat_phase2=float(config.get("lr_feat_phase2", 1e-2)),
         lr_mlp_phase2=float(config.get("lr_mlp_phase2", 1e-3)),
         gamma_phase2=float(config.get("gamma_phase2", 0.99994)),
-        lr_mlp_phase3=float(config.get("lr_mlp_phase3", 5e-4)),
+        lr_mlp_phase3=float(config.get("lr_mlp_phase3", 1e-4)),
         log_every=int(config.get("log_every", 200)),
         debug_every=int(config.get("debug_every", 2000)),
         interactive_progress=bool(config.get("interactive_progress", False)),
         num_crops=int(config.get("num_crops", 1)),
         crop_size=int(config.get("crop_size", 256)),
+        uniform_sample_ratio=float(config.get("uniform_sample_ratio", 1.0)),
+        gaussian_texel_center_sampling=bool(config.get("gaussian_texel_center_sampling", True)),
         validation_res=int(config.get("validation_res", 256)),
-        features_rest_weight=float(config.get("features_rest_weight", 3.0)),
-        scaling_raw_weight=float(config.get("scaling_raw_weight", 1.0)),
-        scaling_relative_weight=float(config.get("scaling_relative_weight", 0.1)),
+        full_validation_every=int(config.get("full_validation_every", 5000)),
+        full_validation_chunk_size=int(config.get("full_validation_chunk_size", 65536)),
+        full_validation_tile_size=int(config.get("full_validation_tile_size", 128)),
+        full_validation_worst_tiles=int(config.get("full_validation_worst_tiles", 10)),
+        full_validation_on_phase_end=bool(config.get("full_validation_on_phase_end", True)),
+        full_validation_worst_tile_weight=float(config.get("full_validation_worst_tile_weight", 0.25)),
+        full_validation_p99_weight=float(config.get("full_validation_p99_weight", 0.10)),
+        full_validation_opacity_weighted=bool(config.get("full_validation_opacity_weighted", True)),
+        features_rest_weight=float(config.get("features_rest_weight", 4.0)),
+        features_rest_mse_weight=float(config.get("features_rest_mse_weight", 5.0)),
+        features_rest_variance_weight=float(config.get("features_rest_variance_weight", 10.0)),
+        features_rest_energy_weight=float(config.get("features_rest_energy_weight", 2.0)),
+        scaling_raw_weight=float(config.get("scaling_raw_weight", 2.0)),
+        scaling_relative_weight=float(config.get("scaling_relative_weight", 0.25)),
         xyz_raw_weight=float(config.get("xyz_raw_weight", 0.25)),
         rotation_angle_weight=float(config.get("rotation_angle_weight", 2.0)),
+        rotation_aligned_weight=float(config.get("rotation_aligned_weight", 1.0)),
+        rotation_norm_weight=float(config.get("rotation_norm_weight", 0.5)),
+        phase3_validation_every=int(config.get("phase3_validation_every", 100)),
 
         #新加
         lod0_only=bool(config.get("lod0_only", True)),
