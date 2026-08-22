@@ -1685,7 +1685,14 @@ def train(model: NeuralMaterialCompressionModel, ref_mips: List[torch.Tensor], c
         )
         pred = _fwd_bc(uv, lod)
 
-        if it == 0 or it % max(1, cfg.debug_every) == 0 or it == cfg.phase2_iters - 1:
+        # debug_every=0 disables periodic full-grid diagnostics; keep only
+        # the first and final iteration in that mode.
+        debug_now = (
+            it == 0
+            or it == cfg.phase2_iters - 1
+            or (cfg.debug_every > 0 and it % cfg.debug_every == 0)
+        )
+        if debug_now:
             debug_training_stage(model, uv, lod, target, pred, f"phase2/iter_{it}")
             debug_fixed_validation(
                 model, ref_base, raw_minimum, raw_scale, cfg, f"phase2/iter_{it}"
@@ -1766,7 +1773,12 @@ def train(model: NeuralMaterialCompressionModel, ref_mips: List[torch.Tensor], c
             )
             pred = _fwd_bc(uv, lod)
 
-            if it == 0 or it % max(1, cfg.debug_every) == 0 or it == cfg.phase3_iters - 1:
+            debug_now = (
+                it == 0
+                or it == cfg.phase3_iters - 1
+                or (cfg.debug_every > 0 and it % cfg.debug_every == 0)
+            )
+            if debug_now:
                 debug_training_stage(model, uv, lod, target, pred, f"phase3_quantized/iter_{it}")
                 debug_fixed_validation(
                     model, ref_base, raw_minimum, raw_scale, cfg,
