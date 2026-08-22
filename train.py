@@ -203,7 +203,15 @@ def training(cfg):
                 gaussians_to_compress = deepcopy(gaussians)
                 gaussians_to_compress.prune_to_square_shape()
                 
-                compr_results = run_compressions(gaussians_to_compress, compr_path, OmegaConf.to_container(cfg.compression))
+                # The training loop's logging/checkpoint section is inside a
+                # torch.no_grad() block, but Neural Texture compression has
+                # its own gradient-based phase-2/phase-3 optimization.
+                with torch.enable_grad():
+                    compr_results = run_compressions(
+                        gaussians_to_compress,
+                        compr_path,
+                        OmegaConf.to_container(cfg.compression),
+                    )
                 wandb.log(compr_results, step=iteration)
 
                 for compr_name, decompressed_gaussians in run_decompressions(
