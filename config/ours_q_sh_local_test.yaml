@@ -121,12 +121,15 @@ sorting:
 
   improvement_break: 0.0001
 
+  # SH-aware ordering for the SH45 Neural Texture experiment.  The
+  # remaining Gaussian attributes are kept in lockstep with this permutation
+  # but do not influence the PLAS objective.
   weights:
-    xyz: 1.0
-    features_dc: 1.0
-    features_rest: 0.0
+    xyz: 0.0
+    features_dc: 0.0
+    features_rest: 1.0
     opacity: 0.0
-    scaling: 1.0
+    scaling: 0.0
     rotation: 0.0
 
 pipeline:
