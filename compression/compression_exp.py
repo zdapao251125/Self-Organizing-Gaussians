@@ -251,7 +251,11 @@ def run_compressions(gaussians, out_path, compr_exp_config):
     return results
 
 def run_single_decompression(compressed_dir, template_gaussians=None):
-    with open(os.path.join(compressed_dir, "compression_config.yml"), 'r') as stream:
+    with open(
+        os.path.join(compressed_dir, "compression_config.yml"),
+        'r',
+        encoding='utf-8',
+    ) as stream:
         experiment_config = yaml.safe_load(stream)
 
     decompressed_gaussians = GaussianModel(experiment_config['max_sh_degree'], experiment_config['disable_xyz_log_activation'])
@@ -369,7 +373,9 @@ def run_experiments(training_cfg, cmdline_iteration, compr_exp_config, disable_l
 
 
 def load_config(config_path: str):
-    with open(config_path, 'r') as stream:
+    # Config files are UTF-8 (the YAML contains Chinese comments), while
+    # Windows Anaconda Prompt commonly defaults to the GBK code page.
+    with open(config_path, 'r', encoding='utf-8') as stream:
         config = yaml.safe_load(stream)
     return config
 
