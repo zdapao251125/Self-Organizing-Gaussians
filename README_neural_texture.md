@@ -30,3 +30,9 @@ debug需要查看详细信息，修改config/compression中的neural_texture.yam
     debug_every: 2000
     debug_outlier_topk: 10
     save_debug_reference: true
+
+当前 SOG 配置只压缩 `_features_rest` 的 45 个高阶 SH 通道。8 张 BC1
+潜纹理和解码器只负责重建这 45 个通道；`xyz`、`features_dc`、`scaling`、
+`rotation` 和 `opacity` 暂时不进入神经纹理文件。在训练过程中的回环评估和
+PLY 导出中，这 14 个属性从同一次压缩使用的排序 Gaussian 模板直接保留。
+因此，单独解码 SH-only 压缩目录时也必须提供对应的未压缩 Gaussian 模板。

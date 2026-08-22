@@ -206,12 +206,14 @@ def training(cfg):
                 compr_results = run_compressions(gaussians_to_compress, compr_path, OmegaConf.to_container(cfg.compression))
                 wandb.log(compr_results, step=iteration)
 
-                for compr_name, decompressed_gaussians in run_decompressions(compr_path):
+                for compr_name, decompressed_gaussians in run_decompressions(
+                    compr_path, template_gaussians=gaussians_to_compress
+                ):
                     training_report(cfg, iteration, scene, decompressed_gaussians, (cfg.pipeline, background), log_name=f"cmpr_{compr_name}", log_GT=False)
                 
                 # decompress plys in last compression iteration
                 if iteration == max(cfg.run.compress_iterations):
-                    decompress_all_to_ply(compr_path)
+                    decompress_all_to_ply(compr_path, template_gaussians=gaussians_to_compress)
 
             # Densification
             if iteration < cfg.optimization.densify_until_iter:

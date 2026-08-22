@@ -35,6 +35,28 @@ pd.set_option('display.max_columns', 500)
 pd.set_option('display.width', 1000)
 
 
+GAUSSIAN_ATTRIBUTE_NAMES = (
+    "_xyz",
+    "_features_dc",
+    "_features_rest",
+    "_scaling",
+    "_rotation",
+    "_opacity",
+)
+
+
+def _copy_gaussian_template(dst, src):
+    """Seed a decoded model with attributes intentionally left uncompressed."""
+    if src is None:
+        return
+    for attr_name in GAUSSIAN_ATTRIBUTE_NAMES:
+        value = getattr(src, attr_name, None)
+        if isinstance(value, torch.Tensor) and value.numel():
+            setattr(dst, attr_name, value.detach().clone())
+    if hasattr(src, "grid_sidelen"):
+        dst.grid_sidelen = src.grid_sidelen
+
+
 @dataclass
 class QuantEval:
     psnr: float
@@ -177,6 +199,14 @@ def run_single_compression(gaussians, experiment_out_path, experiment_config):
         neural_config['attributes'] = experiment_config.get('attributes', [])
         total_size_bytes = compress_gaussians(gaussians, experiment_out_path, neural_config)
 
+        compressed_attributes = [
+            item['name'] if isinstance(item, dict) else item
+            for item in experiment_config.get('attributes', [])
+        ]
+        experiment_config['compressed_attributes'] = compressed_attributes
+        experiment_config['uncompressed_attributes'] = [
+            name for name in GAUSSIAN_ATTRIBUTE_NAMES if name not in compressed_attributes
+        ]
         experiment_config['max_sh_degree'] = gaussians.max_sh_degree
         experiment_config['active_sh_degree'] = gaussians.active_sh_degree
         experiment_config['disable_xyz_log_activation'] = gaussians.disable_xyz_log_activation
@@ -220,7 +250,7 @@ def run_compressions(gaussians, out_path, compr_exp_config):
 
     return results
 
-def run_single_decompression(compressed_dir):
+def run_single_decompression(compressed_dir, template_gaussians=None):
     with open(os.path.join(compressed_dir, "compression_config.yml"), 'r') as stream:
         experiment_config = yaml.safe_load(stream)
 
@@ -228,6 +258,7 @@ def run_single_decompression(compressed_dir):
     decompressed_gaussians.active_sh_degree = experiment_config['active_sh_degree']
 
     if experiment_config.get('method') == 'neural-texture':
+        _copy_gaussian_template(decompressed_gaussians, template_gaussians)
         neural_config = dict(experiment_config.get('params', {}))
         neural_config['attributes'] = experiment_config.get('attributes', [])
         for attr_name, decoded_attr in decompress_gaussians(compressed_dir, neural_config).items():
@@ -245,13 +276,15 @@ def run_single_decompression(compressed_dir):
 
     return decompressed_gaussians
 
-def run_decompressions(compressions_dir):
+def run_decompressions(compressions_dir, template_gaussians=None):
     
     for compressed_dir in os.listdir(compressions_dir):
         compressed_dir_path = os.path.join(compressions_dir, compressed_dir)
         if not os.path.isdir(compressed_dir_path):
             continue
-        yield os.path.basename(compressed_dir_path), run_single_decompression(compressed_dir_path)
+        yield os.path.basename(compressed_dir_path), run_single_decompression(
+            compressed_dir_path, template_gaussians=template_gaussians
+        )
 
 def run_roundtrip(gaussians, out_path, experiment_config):
 
@@ -263,7 +296,9 @@ def run_roundtrip(gaussians, out_path, experiment_config):
     
     total_size_bytes = run_single_compression(gaussians, experiment_out_path, experiment_config)
     
-    decompressed_gaussians = run_single_decompression(experiment_out_path)
+    decompressed_gaussians = run_single_decompression(
+        experiment_out_path, template_gaussians=gaussians
+    )
 
     return decompressed_gaussians, total_size_bytes, experiment_out_path
 

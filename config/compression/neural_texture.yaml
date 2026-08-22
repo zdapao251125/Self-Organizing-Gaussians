@@ -1,14 +1,9 @@
 experiments:
-  - name: neural_texture_bc1
+  - name: neural_texture_bc1_sh45
     method: neural-texture
 
     attributes:
-      - name: _xyz
-      - name: _features_dc
       - name: _features_rest
-      - name: _scaling
-      - name: _rotation
-      - name: _opacity
 
 
     params:
@@ -102,12 +97,7 @@ experiments:
       tail_residual_dtype: float16
 
       tail_attributes:
-        - _xyz
-        - _features_dc
         - _features_rest
-        - _scaling
-        - _rotation
-        - _opacity
 
       # ==============================
       # 训练后预测误差稀疏纠错
@@ -116,9 +106,4 @@ experiments:
       prediction_correction_dtype: float16
 
       prediction_correction_fractions:
-        _xyz: 0.005
-        _features_dc: 0.002
         _features_rest: 0.002
-        _scaling: 0.005
-        _rotation: 0.005
-        _opacity: 0.002

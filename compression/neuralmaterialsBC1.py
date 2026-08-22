@@ -76,6 +76,18 @@ GAUSSIAN_CHANNELS = (
 )
 
 
+def attribute_channels(num_channels: int):
+    """Return the semantic channel layout used by the active compression target."""
+    if num_channels == 45:
+        return (("features_rest", 0, 45),)
+    if num_channels == 59:
+        return GAUSSIAN_CHANNELS
+    raise ValueError(
+        f"Unsupported Gaussian compression channel count: {num_channels}. "
+        "Expected SH rest only (45) or all Gaussian attributes (59)."
+    )
+
+
 @torch.no_grad()
 def debug_tensor(name: str, value: torch.Tensor) -> None:
     x = value.detach().float()
@@ -119,9 +131,8 @@ def debug_gaussian_batch(stage: str, pred: torch.Tensor, target: torch.Tensor) -
     debug_tensor(f"{stage}/target", target)
     debug_tensor(f"{stage}/pred", pred)
     debug_compare(f"{stage}/all", pred, target)
-    for attr, begin, end in GAUSSIAN_CHANNELS:
-        if pred.shape[-1] >= end and target.shape[-1] >= end:
-            debug_compare(f"{stage}/{attr}", pred[:, begin:end], target[:, begin:end])
+    for attr, begin, end in attribute_channels(pred.shape[-1]):
+        debug_compare(f"{stage}/{attr}", pred[:, begin:end], target[:, begin:end])
 
 
 def ste_round(x: torch.Tensor) -> torch.Tensor:
@@ -1205,11 +1216,36 @@ def gaussian_attribute_loss(
     cfg: TrainConfig,
 ) -> torch.Tensor:
     """Hybrid normalized-domain and render-semantic Gaussian loss."""
+    if pred.shape[-1] == 45 and target.shape[-1] == 45:
+        pred_raw = pred * raw_scale + raw_minimum
+        target_raw = target * raw_scale + raw_minimum
+        balanced_l1 = F.l1_loss(
+            pred * channel_balance,
+            target * channel_balance,
+        )
+        features_rest_mse = F.mse_loss(pred, target)
+        features_rest_variance = (
+            pred.std(dim=0, unbiased=False)
+            - target.std(dim=0, unbiased=False)
+        ).abs().mean()
+        features_rest_energy = (
+            pred.square().mean(dim=0).sqrt()
+            - target.square().mean(dim=0).sqrt()
+        ).abs().mean()
+        raw_l1 = F.smooth_l1_loss(pred_raw, target_raw)
+        return (
+            cfg.features_rest_weight * balanced_l1
+            + cfg.features_rest_mse_weight * features_rest_mse
+            + cfg.features_rest_variance_weight * features_rest_variance
+            + cfg.features_rest_energy_weight * features_rest_energy
+            + raw_l1
+        )
+
     if pred.shape[-1] != 59 or target.shape[-1] != 59:
         raise ValueError(
-            "gaussian_attribute_loss expects 59 channels "
+            "gaussian_attribute_loss expects either 45 SH-rest channels or 59 full Gaussian channels "
             f"(pred={pred.shape[-1]}, target={target.shape[-1]}). "
-            "Use a metadata-driven channel layout for other SH degrees/attribute sets."
+            "Use a metadata-driven channel layout for other attribute sets."
         )
     weights = {
         "xyz": 20.0, "features_dc": 5.0,
@@ -1224,7 +1260,7 @@ def gaussian_attribute_loss(
             pred[:, begin:end] * channel_balance[:, begin:end],
             target[:, begin:end] * channel_balance[:, begin:end],
         )
-        for name, begin, end in GAUSSIAN_CHANNELS
+        for name, begin, end in attribute_channels(pred.shape[-1])
     )
 
     pred_raw = pred * raw_scale + raw_minimum
@@ -1289,9 +1325,7 @@ def gaussian_attribute_loss(
 
 @torch.no_grad()
 def debug_error_quantiles(stage: str, pred: torch.Tensor, target: torch.Tensor) -> None:
-    for attr, begin, end in GAUSSIAN_CHANNELS:
-        if pred.shape[1] < end:
-            continue
+    for attr, begin, end in attribute_channels(pred.shape[1]):
         # 每个样本/高斯误差的幅度相同，因此宽属性并不仅因通道更多而占据主导地位。
         err = (pred[:, begin:end] - target[:, begin:end]).square().mean(1).sqrt()
         qs = torch.quantile(err.float(), err.new_tensor([0.50, 0.95, 0.99, 0.999]))
@@ -1320,13 +1354,14 @@ def debug_fixed_validation(model, ref_base, raw_minimum, raw_scale, cfg, stage: 
     debug_error_quantiles(f"{stage}/normalized", pred, target)
     pred_raw, target_raw = pred * raw_scale + raw_minimum, target * raw_scale + raw_minimum
     debug_error_quantiles(f"{stage}/raw", pred_raw, target_raw)
-    q_pred = F.normalize(pred_raw[:, 54:58], dim=1, eps=EPS)
-    q_target = F.normalize(target_raw[:, 54:58], dim=1, eps=EPS)
-    angle = 2.0 * torch.acos((q_pred * q_target).sum(1).abs().clamp(0, 1 - 1e-7))
-    aq = torch.quantile(angle * (180.0 / math.pi), angle.new_tensor([.5, .95, .99, .999]))
-    print(f"[rotation-angle:{stage}] p50={aq[0].item():.3f}deg p95={aq[1].item():.3f}deg "
-          f"p99={aq[2].item():.3f}deg p99.9={aq[3].item():.3f}deg "
-          f"max={(angle.max() * 180.0 / math.pi).item():.3f}deg")
+    if pred.shape[1] >= 58:
+        q_pred = F.normalize(pred_raw[:, 54:58], dim=1, eps=EPS)
+        q_target = F.normalize(target_raw[:, 54:58], dim=1, eps=EPS)
+        angle = 2.0 * torch.acos((q_pred * q_target).sum(1).abs().clamp(0, 1 - 1e-7))
+        aq = torch.quantile(angle * (180.0 / math.pi), angle.new_tensor([.5, .95, .99, .999]))
+        print(f"[rotation-angle:{stage}] p50={aq[0].item():.3f}deg p95={aq[1].item():.3f}deg "
+              f"p99={aq[2].item():.3f}deg p99.9={aq[3].item():.3f}deg "
+              f"max={(angle.max() * 180.0 / math.pi).item():.3f}deg")
 
 
 @torch.no_grad()
@@ -1364,7 +1399,7 @@ def full_grid_validation(
     tile_count = torch.zeros(tiles_x * tiles_y, dtype=torch.int64)
     attr_errors = {
         name: torch.empty(total, dtype=torch.float32)
-        for name, begin, end in GAUSSIAN_CHANNELS if channels >= end
+        for name, begin, end in attribute_channels(channels)
     }
     pixel_errors = torch.empty(total, dtype=torch.float32)
     rotation_angles = torch.empty(total, dtype=torch.float32) if channels >= 58 else None
@@ -1398,9 +1433,7 @@ def full_grid_validation(
 
         pred_raw = pred * raw_scale + raw_minimum
         target_raw = target * raw_scale + raw_minimum
-        for name, attr_begin, attr_end in GAUSSIAN_CHANNELS:
-            if channels < attr_end:
-                continue
+        for name, attr_begin, attr_end in attribute_channels(channels):
             err = (pred_raw[:, attr_begin:attr_end] - target_raw[:, attr_begin:attr_end])
             attr_errors[name][begin_index:end_index] = err.square().mean(1).sqrt().cpu()
 
@@ -1475,10 +1508,9 @@ def full_grid_validation(
         )
     pred_var = (pred_sq_sum / total - (pred_sum / total).square()).clamp_min(0)
     target_var = (target_sq_sum / total - (target_sum / total).square()).clamp_min(0)
-    for name, attr_begin, attr_end in GAUSSIAN_CHANNELS:
-        if channels >= attr_end:
-            ratio = pred_var[attr_begin:attr_end].sqrt().mean() / target_var[attr_begin:attr_end].sqrt().mean().clamp_min(1e-12)
-            print(f"[full-std-ratio:{stage}/{name}] pred_over_target={ratio.item():.6g}")
+    for name, attr_begin, attr_end in attribute_channels(channels):
+        ratio = pred_var[attr_begin:attr_end].sqrt().mean() / target_var[attr_begin:attr_end].sqrt().mean().clamp_min(1e-12)
+        print(f"[full-std-ratio:{stage}/{name}] pred_over_target={ratio.item():.6g}")
     if weighted_den > 0.0:
         print(
             f"[full-opacity-weighted:{stage}] xyz_rmse={math.sqrt(weighted_sse['xyz']/weighted_den):.7g} "
@@ -1549,15 +1581,14 @@ def train(model: NeuralMaterialCompressionModel, ref_mips: List[torch.Tensor], c
             f"minimum={raw_minimum.shape[1]}, scale={raw_scale.shape[1]}"
         )
     debug_tensor("reference/base_normalized", ref_base)
-    for attr, begin, end in GAUSSIAN_CHANNELS:
-        if C >= end:
-            debug_tensor(f"reference/{attr}", ref_base[begin:end])
+    for attr, begin, end in attribute_channels(C):
+        debug_tensor(f"reference/{attr}", ref_base[begin:end])
 
     # 保留材料版本中对逆标准有用的平衡，但将其规范化到每个语义属性内部，防止其改变该属性的整体配置权重。
     # 这能够在不使低方差通道主导整个目标的情况下平衡复杂的SH通道。
     normalized_std = ref_base.std(dim=(1, 2), unbiased=False).clamp_min(1e-4)
     channel_balance = normalized_std.reciprocal()
-    for attr, begin, end in GAUSSIAN_CHANNELS:
+    for attr, begin, end in attribute_channels(C):
         group = channel_balance[begin:end]
         channel_balance[begin:end] = (group / group.mean()).clamp(0.25, 4.0)
         print(
@@ -1594,19 +1625,18 @@ def train(model: NeuralMaterialCompressionModel, ref_mips: List[torch.Tensor], c
     # channel_weight = 1.0 / raw_std
     # channel_weight = torch.clamp(channel_weight, max=10.0)
 
-    channel_weight = torch.ones(
-    C,
-    device=device,
-    dtype=ref_base.dtype,
-    )
-
-    # SH degree 3、所有属性均启用时的通道布局
-    channel_weight[0:3] = 20.0    # xyz
-    channel_weight[3:6] = 5.0     # features_dc
-    channel_weight[6:51] = 0.5    # features_rest
-    channel_weight[51:54] = 10.0  # scaling
-    channel_weight[54:58] = 5.0   # rotation
-    channel_weight[58:59] = 10.0  # opacity
+    channel_weight = torch.ones(C, device=device, dtype=ref_base.dtype)
+    if C == 59:
+        # Retained for compatibility with the full Gaussian experiment.
+        channel_weight[0:3] = 20.0    # xyz
+        channel_weight[3:6] = 5.0     # features_dc
+        channel_weight[6:51] = 0.5    # features_rest
+        channel_weight[51:54] = 10.0  # scaling
+        channel_weight[54:58] = 5.0   # rotation
+        channel_weight[58:59] = 10.0  # opacity
+    else:
+        # The SH-rest-only experiment has a local 45-channel layout.
+        channel_weight.fill_(1.0)
 
 
     # Tile135D weight
