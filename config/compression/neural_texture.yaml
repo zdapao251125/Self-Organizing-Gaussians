@@ -1,14 +1,46 @@
 experiments:
-  - name: neural_texture_bc1
+  - name: neural_texture_bc1_sh45
     method: neural-texture
 
     attributes:
-      - name: _xyz
-      - name: _features_dc
       - name: _features_rest
+
+    # Remaining attributes use the original SOG codec settings from
+    # config/compression/umbrella_sh.yaml. Together with the neural SH stream,
+    # these files form a standalone compressed model.
+    sog_attributes:
+      - name: _xyz
+        method: exr
+        normalize: false
+        contract: false
+        quantize: 13
+        params:
+          compression: zip
+      - name: _features_dc
+        method: jpeg-xl
+        normalize: true
+        params:
+          level: 90
       - name: _scaling
+        method: exr
+        normalize: false
+        contract: false
+        quantize: 6
+        params:
+          compression: none
       - name: _rotation
+        method: exr
+        normalize: false
+        quantize: 6
+        params:
+          compression: zip
       - name: _opacity
+        method: exr
+        normalize: true
+        contract: false
+        quantize: 5
+        params:
+          compression: none
 
 
     params:
@@ -30,8 +62,6 @@ experiments:
       # 网络容量
       # ==============================
       hidden_dim: 128
-      features_rest_decoder_hidden_dim: 128
-      scaling_decoder_hidden_dim: 32
       latent_resolutions: [2048, 2048, 2048, 2048, 1024, 1024, 1024, 1024]
       latent_mips: [12, 12, 12, 12, 11, 11, 11, 11]
 
@@ -80,20 +110,6 @@ experiments:
       features_rest_variance_weight: 10.0
       features_rest_energy_weight: 2.0
 
-      xyz_raw_weight: 0.25
-
-      scaling_raw_weight: 2.0
-      scaling_relative_weight: 0.25
-
-      # ==============================
-      # 四元数 rotation 损失
-      # ==============================
-      rotation_angle_weight: 2.0
-      rotation_aligned_weight: 1.0
-      rotation_norm_weight: 0.5
-      canonicalize_rotation_sign: true
-      clamp_rotation_before_denormalization: false
-
       # ==============================
       # 原始数值长尾裁剪
       # 每侧裁剪0.1%，并稀疏保存原值
@@ -102,12 +118,7 @@ experiments:
       tail_residual_dtype: float16
 
       tail_attributes:
-        - _xyz
-        - _features_dc
         - _features_rest
-        - _scaling
-        - _rotation
-        - _opacity
 
       # ==============================
       # 训练后预测误差稀疏纠错
@@ -116,9 +127,4 @@ experiments:
       prediction_correction_dtype: float16
 
       prediction_correction_fractions:
-        _xyz: 0.005
-        _features_dc: 0.002
         _features_rest: 0.002
-        _scaling: 0.005
-        _rotation: 0.005
-        _opacity: 0.002
