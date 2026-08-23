@@ -35,6 +35,52 @@ pd.set_option('display.max_columns', 500)
 pd.set_option('display.width', 1000)
 
 
+GAUSSIAN_ATTRIBUTE_NAMES = (
+    "_xyz",
+    "_features_dc",
+    "_features_rest",
+    "_scaling",
+    "_rotation",
+    "_opacity",
+)
+
+
+def _copy_gaussian_template(dst, src):
+    """Seed a decoded model with attributes intentionally left uncompressed."""
+    if src is None:
+        return
+    for attr_name in GAUSSIAN_ATTRIBUTE_NAMES:
+        value = getattr(src, attr_name, None)
+        if isinstance(value, torch.Tensor) and value.numel():
+            setattr(dst, attr_name, value.detach().clone())
+    if hasattr(src, "grid_sidelen"):
+        dst.grid_sidelen = src.grid_sidelen
+
+
+def _attribute_name(attribute):
+    return attribute["name"] if isinstance(attribute, dict) else attribute
+
+
+def _validate_hybrid_attributes(neural_attributes, sog_attributes):
+    """Require a standalone stream with every Gaussian attribute exactly once."""
+    neural_names = [_attribute_name(item) for item in neural_attributes]
+    sog_names = [_attribute_name(item) for item in sog_attributes]
+    overlap = sorted(set(neural_names) & set(sog_names))
+    missing = sorted(set(GAUSSIAN_ATTRIBUTE_NAMES) - set(neural_names) - set(sog_names))
+    unknown = sorted((set(neural_names) | set(sog_names)) - set(GAUSSIAN_ATTRIBUTE_NAMES))
+    duplicates = sorted(
+        name for name in set(neural_names + sog_names)
+        if (neural_names + sog_names).count(name) > 1
+    )
+    if overlap or missing or unknown or duplicates:
+        raise ValueError(
+            "Invalid hybrid attribute layout: "
+            f"overlap={overlap}, missing={missing}, unknown={unknown}, "
+            f"duplicates={duplicates}"
+        )
+    return neural_names, sog_names
+
+
 @dataclass
 class QuantEval:
     psnr: float
@@ -173,10 +219,39 @@ def run_single_compression(gaussians, experiment_out_path, experiment_config):
     total_size_bytes = 0
 
     if experiment_config.get('method') == 'neural-texture':
+        neural_attributes = list(experiment_config.get('attributes', []))
+        sog_attributes = list(experiment_config.get('sog_attributes', []))
+        neural_names, sog_names = _validate_hybrid_attributes(
+            neural_attributes, sog_attributes
+        )
+
+        # SH45 (or any explicitly listed neural attributes) uses the neural
+        # texture/BC1 path.
         neural_config = dict(experiment_config.get('params', {}))
-        neural_config['attributes'] = experiment_config.get('attributes', [])
+        neural_config['attributes'] = neural_attributes
         total_size_bytes = compress_gaussians(gaussians, experiment_out_path, neural_config)
 
+        # The remaining attributes use the original SOG codecs and quantizers.
+        for attribute in sog_attributes:
+            compressed_file, min_val, max_val = compress_attr(
+                attribute, gaussians, experiment_out_path
+            )
+            attr_name = attribute['name']
+            compressed_files[attr_name] = compressed_file
+            compressed_min_vals[attr_name] = min_val
+            compressed_max_vals[attr_name] = max_val
+            total_size_bytes += os.path.getsize(
+                os.path.join(experiment_out_path, compressed_file)
+            )
+
+        pd.DataFrame(
+            [compressed_min_vals, compressed_max_vals, compressed_files],
+            index=["min", "max", "file"],
+        ).T.to_csv(os.path.join(experiment_out_path, "compression_info.csv"))
+
+        experiment_config['compressed_attributes'] = neural_names + sog_names
+        experiment_config['uncompressed_attributes'] = []
+        experiment_config['standalone_decode'] = True
         experiment_config['max_sh_degree'] = gaussians.max_sh_degree
         experiment_config['active_sh_degree'] = gaussians.active_sh_degree
         experiment_config['disable_xyz_log_activation'] = gaussians.disable_xyz_log_activation
@@ -220,14 +295,40 @@ def run_compressions(gaussians, out_path, compr_exp_config):
 
     return results
 
-def run_single_decompression(compressed_dir):
-    with open(os.path.join(compressed_dir, "compression_config.yml"), 'r') as stream:
+def run_single_decompression(compressed_dir, template_gaussians=None):
+    with open(
+        os.path.join(compressed_dir, "compression_config.yml"),
+        'r',
+        encoding='utf-8',
+    ) as stream:
         experiment_config = yaml.safe_load(stream)
 
     decompressed_gaussians = GaussianModel(experiment_config['max_sh_degree'], experiment_config['disable_xyz_log_activation'])
     decompressed_gaussians.active_sh_degree = experiment_config['active_sh_degree']
 
     if experiment_config.get('method') == 'neural-texture':
+        sog_attributes = list(experiment_config.get('sog_attributes', []))
+        if sog_attributes:
+            compr_info = pd.read_csv(
+                os.path.join(compressed_dir, "compression_info.csv"), index_col=0
+            )
+            for attribute in sog_attributes:
+                attr_name = attribute["name"]
+                compressed_file = os.path.join(
+                    compressed_dir, compr_info.loc[attr_name, "file"]
+                )
+                decompress_attr(
+                    decompressed_gaussians,
+                    attribute,
+                    compressed_file,
+                    compr_info.loc[attr_name, "min"],
+                    compr_info.loc[attr_name, "max"],
+                )
+        else:
+            # Backward compatibility for old SH-only experiment directories.
+            # Such streams are not standalone and still need the source model.
+            _copy_gaussian_template(decompressed_gaussians, template_gaussians)
+
         neural_config = dict(experiment_config.get('params', {}))
         neural_config['attributes'] = experiment_config.get('attributes', [])
         for attr_name, decoded_attr in decompress_gaussians(compressed_dir, neural_config).items():
@@ -245,13 +346,15 @@ def run_single_decompression(compressed_dir):
 
     return decompressed_gaussians
 
-def run_decompressions(compressions_dir):
+def run_decompressions(compressions_dir, template_gaussians=None):
     
     for compressed_dir in os.listdir(compressions_dir):
         compressed_dir_path = os.path.join(compressions_dir, compressed_dir)
         if not os.path.isdir(compressed_dir_path):
             continue
-        yield os.path.basename(compressed_dir_path), run_single_decompression(compressed_dir_path)
+        yield os.path.basename(compressed_dir_path), run_single_decompression(
+            compressed_dir_path, template_gaussians=template_gaussians
+        )
 
 def run_roundtrip(gaussians, out_path, experiment_config):
 
@@ -263,7 +366,9 @@ def run_roundtrip(gaussians, out_path, experiment_config):
     
     total_size_bytes = run_single_compression(gaussians, experiment_out_path, experiment_config)
     
-    decompressed_gaussians = run_single_decompression(experiment_out_path)
+    decompressed_gaussians = run_single_decompression(
+        experiment_out_path, template_gaussians=gaussians
+    )
 
     return decompressed_gaussians, total_size_bytes, experiment_out_path
 
@@ -334,7 +439,9 @@ def run_experiments(training_cfg, cmdline_iteration, compr_exp_config, disable_l
 
 
 def load_config(config_path: str):
-    with open(config_path, 'r') as stream:
+    # Config files are UTF-8 (the YAML contains Chinese comments), while
+    # Windows Anaconda Prompt commonly defaults to the GBK code page.
+    with open(config_path, 'r', encoding='utf-8') as stream:
         config = yaml.safe_load(stream)
     return config
 
