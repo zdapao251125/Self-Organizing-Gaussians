@@ -1,130 +1,89 @@
 experiments:
-  - name: neural_texture_bc1_sh45
+  - name: xyz_jxl_other_neural
     method: neural-texture
 
+    # One joint neural texture for every non-XYZ Gaussian attribute. These
+    # attributes keep the original SOG/PLAS grid order.
     attributes:
+      - name: _features_dc
       - name: _features_rest
+      - name: _scaling
+      - name: _rotation
+      - name: _opacity
 
-    # Remaining attributes use the original SOG codec settings from
-    # config/compression/umbrella_sh.yaml. Together with the neural SH stream,
-    # these files form a standalone compressed model.
+    # XYZ follows the original SOG JPEG-XL path instead of Morton/neural
+    # compression. The original grid order is preserved, so no permutation
+    # metadata is required during decoding.
     sog_attributes:
       - name: _xyz
-        method: exr
-        normalize: false
-        contract: false
-        quantize: 13
-        params:
-          compression: zip
-      - name: _features_dc
         method: jpeg-xl
         normalize: true
+        quantize: 14
         params:
-          level: 90
-      - name: _scaling
-        method: exr
-        normalize: false
-        contract: false
-        quantize: 6
-        params:
-          compression: none
-      - name: _rotation
-        method: exr
-        normalize: false
-        quantize: 6
-        params:
-          compression: zip
-      - name: _opacity
-        method: exr
-        normalize: true
-        contract: false
-        quantize: 5
-        params:
-          compression: none
-
+          level: 101
 
     params:
-      # ==============================
-      # 基础配置
-      # ==============================
       device: cuda
       interactive_progress: true
       log_every: 200
-      decode_chunk_size: 65536
-      save_debug_reference: false
-      verbose_debug: false
       debug_every: 0
       debug_outlier_topk: 0
+      verbose_debug: false
+      save_debug_reference: false
+      decode_chunk_size: 65536
       gaussian_texel_center_sampling: true
       lod0_only: true
 
-      # ==============================
-      # 网络容量
-      # ==============================
-      hidden_dim: 128
+      # Joint representation for DC + SH45 + scaling + rotation + opacity.
+      hidden_dim: 192
       latent_resolutions: [2048, 2048, 2048, 2048, 1024, 1024, 1024, 1024]
       latent_mips: [12, 12, 12, 12, 11, 11, 11, 11]
 
-      # ==============================
-      # 训练次数
-      # ==============================
       phase2_iters: 50000
       phase3_iters: 1000
-
       lr_feat_phase2: 0.01
       lr_mlp_phase2: 0.001
       gamma_phase2: 0.99994
       lr_mlp_phase3: 0.0001
 
-      # ==============================
-      # 训练采样
-      # ==============================
       crop_size: 256
       num_crops: 1
       uniform_sample_ratio: 1.0
 
-      # ==============================
-      # 快速固定网格验证
-      # ==============================
       validation_res: 256
-
-      # ==============================
-      # 完整网格分块验证
-      # ==============================
       full_validation_every: 5000
       full_validation_chunk_size: 65536
       full_validation_tile_size: 128
       full_validation_worst_tiles: 10
       full_validation_on_phase_end: true
-      
-      # 完整验证模型评分：
       full_validation_worst_tile_weight: 0.25
       full_validation_p99_weight: 0.10
       full_validation_opacity_weighted: true
 
-      # ==============================
-      # 属性训练权重
-      # ==============================
       features_rest_weight: 4.0
       features_rest_mse_weight: 5.0
       features_rest_variance_weight: 10.0
       features_rest_energy_weight: 2.0
+      scaling_raw_weight: 2.0
+      scaling_relative_weight: 0.25
+      rotation_angle_weight: 2.0
+      rotation_aligned_weight: 1.0
+      rotation_norm_weight: 0.5
 
-      # ==============================
-      # 原始数值长尾裁剪
-      # 每侧裁剪0.1%，并稀疏保存原值
-      # ==============================
       tail_fraction: 0.001
       tail_residual_dtype: float16
-
       tail_attributes:
+        - _features_dc
         - _features_rest
+        - _scaling
+        - _rotation
+        - _opacity
 
-      # ==============================
-      # 训练后预测误差稀疏纠错
-      # ==============================
       prediction_correction_fraction: 0.002
       prediction_correction_dtype: float16
-
       prediction_correction_fractions:
+        _features_dc: 0.002
         _features_rest: 0.002
+        _scaling: 0.005
+        _rotation: 0.005
+        _opacity: 0.002
