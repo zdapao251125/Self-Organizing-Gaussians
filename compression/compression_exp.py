@@ -81,6 +81,149 @@ def _validate_hybrid_attributes(neural_attributes, sog_attributes):
     return neural_names, sog_names
 
 
+def _morton_code_3d(integer_xyz, bits):
+    code = torch.zeros(
+        integer_xyz.shape[0], dtype=torch.int64, device=integer_xyz.device
+    )
+    for bit in range(int(bits)):
+        code |= ((integer_xyz[:, 0] >> bit) & 1) << (3 * bit)
+        code |= ((integer_xyz[:, 1] >> bit) & 1) << (3 * bit + 1)
+        code |= ((integer_xyz[:, 2] >> bit) & 1) << (3 * bit + 2)
+    return code
+
+
+@torch.no_grad()
+def _prepare_morton_block_layout(gaussians, experiment_config):
+    """Build the XYZ Morton/tile order without changing the source layout.
+
+    The returned array maps Morton-layout positions to original SOG/PLAS
+    positions. Keeping the source model untouched lets the non-XYZ stream use
+    the original layout while XYZ uses the spatially local layout.
+    """
+    params = dict(experiment_config.get('params', {}) or {})
+    if not bool(params.get('xyz_morton_block_sort', False)):
+        return None
+    tile_size = int(params.get('xyz_block_size', 16))
+    morton_bits = int(params.get('xyz_morton_bits', 10))
+    count = int(gaussians._xyz.shape[0])
+    side = int(np.sqrt(count))
+    if side * side != count:
+        raise ValueError('prune_to_square_shape() must run before Morton layout')
+    if tile_size <= 0 or side % tile_size != 0:
+        raise ValueError(
+            f'Grid side {side} must be divisible by xyz_block_size={tile_size}'
+        )
+
+    xyz = gaussians._xyz.detach().float().reshape(count, -1)[:, :3]
+    sample = xyz
+    if count > 200000:
+        sample_ids = torch.linspace(0, count - 1, 200000, device=xyz.device).long()
+        sample = xyz[sample_ids]
+    low = torch.quantile(sample, 0.001, dim=0)
+    high = torch.quantile(sample, 0.999, dim=0)
+    xyz01 = ((xyz - low) / (high - low).clamp_min(1e-8)).clamp(0.0, 1.0)
+    integer_xyz = torch.round(xyz01 * ((1 << morton_bits) - 1)).long()
+    spatial_order = torch.argsort(
+        _morton_code_3d(integer_xyz, morton_bits), stable=True
+    )
+
+    tiles_per_side = side // tile_size
+    final_order = (
+        spatial_order.reshape(tiles_per_side, tiles_per_side, tile_size, tile_size)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .reshape(-1)
+    )
+    print(
+        f'[xyz-layout] generated Morton({morton_bits} bit/axis) order -> '
+        f'{tiles_per_side}x{tiles_per_side} tiles -> '
+        f'{side}x{side} grid, tile={tile_size}x{tile_size}; '
+        'non-XYZ attributes keep the original SOG/PLAS order'
+    )
+    return final_order
+
+
+def _clone_gaussians(gaussians):
+    """Create an attribute-only clone suitable for compression layout changes."""
+    cloned = GaussianModel(
+        gaussians.max_sh_degree, gaussians.disable_xyz_log_activation
+    )
+    cloned.active_sh_degree = gaussians.active_sh_degree
+    _copy_gaussian_template(cloned, gaussians)
+    return cloned
+
+
+def _restore_grid_from_layout(grid, layout_to_original):
+    """Restore decoded XYZ from Morton layout to the original SOG/PLAS order.
+
+    ``decompress_gaussians`` currently returns NumPy HWC arrays, while some
+    callers may use torch CHW/HWC tensors. Support all of those representations
+    and preserve the input type and layout.
+    """
+    if grid.ndim != 3:
+        raise ValueError(f'Expected a 3D decoded XYZ grid, got shape={tuple(grid.shape)}')
+
+    is_tensor = isinstance(grid, torch.Tensor)
+    order_count = int(layout_to_original.numel())
+    is_hwc = grid.shape[-1] == 3 and grid.shape[0] * grid.shape[1] == order_count
+    is_chw = grid.shape[0] == 3 and grid.shape[1] * grid.shape[2] == order_count
+    if not is_hwc and not is_chw:
+        raise ValueError(
+            'Morton index length/layout does not match decoded XYZ grid: '
+            f'indices={order_count}, grid={tuple(grid.shape)}'
+        )
+
+    if is_tensor:
+        order = layout_to_original.to(device=grid.device, dtype=torch.long)
+        records = (
+            grid.reshape(-1, 3)
+            if is_hwc
+            else grid.permute(1, 2, 0).contiguous().reshape(-1, 3)
+        )
+        restored = torch.empty_like(records)
+        restored[order] = records
+        if is_hwc:
+            return restored.reshape(grid.shape)
+        return restored.reshape(grid.shape[1], grid.shape[2], 3).permute(2, 0, 1).contiguous()
+
+    order = layout_to_original.cpu().numpy().astype(np.int64, copy=False)
+    records = (
+        np.asarray(grid).reshape(-1, 3)
+        if is_hwc
+        else np.asarray(grid).transpose(1, 2, 0).reshape(-1, 3)
+    )
+    restored = np.empty_like(records)
+    restored[order] = records
+    if is_hwc:
+        return restored.reshape(grid.shape)
+    return restored.reshape(grid.shape[1], grid.shape[2], 3).transpose(2, 0, 1)
+
+
+@torch.no_grad()
+def _report_roundtrip_quantiles(original, reconstructed, attr_name):
+    target = getattr(original, attr_name).detach().float()
+    prediction = getattr(reconstructed, attr_name).detach().float()
+    delta = (
+        prediction.reshape(prediction.shape[0], -1)
+        - target.reshape(target.shape[0], -1)
+    )
+    per_gaussian = delta.square().mean(1).sqrt()
+    q = torch.quantile(
+        per_gaussian,
+        per_gaussian.new_tensor([0.50, 0.95, 0.99, 0.999]),
+    )
+    rmse = delta.square().mean().sqrt()
+    data_range = (target.max() - target.min()).clamp_min(1e-8)
+    attr_psnr = 20.0 * torch.log10(data_range / rmse.clamp_min(1e-8))
+    print(
+        f'[roundtrip-raw:{attr_name}] rmse={rmse.item():.7g} '
+        f'psnr_range={attr_psnr.item():.3f}dB '
+        f'p50={q[0].item():.7g} p95={q[1].item():.7g} '
+        f'p99={q[2].item():.7g} p99.9={q[3].item():.7g} '
+        f'max={per_gaussian.max().item():.7g}'
+    )
+
+
 @dataclass
 class QuantEval:
     psnr: float
@@ -218,6 +361,78 @@ def run_single_compression(gaussians, experiment_out_path, experiment_config):
 
     total_size_bytes = 0
 
+    if experiment_config.get('method') == 'dual-neural-texture':
+        groups = dict(experiment_config.get('neural_groups', {}) or {})
+        if not groups:
+            raise ValueError("dual-neural-texture requires neural_groups")
+        all_neural_attributes = []
+        common_params = dict(experiment_config.get('params', {}) or {})
+        morton_order = getattr(gaussians, '_xyz_morton_order', None)
+        permutation_file = str(
+            common_params.get('xyz_morton_permutation_file', 'morton_order.npy')
+        )
+        if morton_order is not None:
+            # Full, uncompressed uint32 index: Morton position -> original index.
+            permutation_path = os.path.join(experiment_out_path, permutation_file)
+            np.save(
+                permutation_path,
+                morton_order.detach().cpu().numpy().astype(np.uint32, copy=False),
+                allow_pickle=False,
+            )
+            permutation_size = os.path.getsize(permutation_path)
+            total_size_bytes += permutation_size
+            experiment_config['xyz_morton_permutation_file'] = permutation_file
+            experiment_config['xyz_morton_permutation_semantics'] = (
+                'layout_position_to_original_position'
+            )
+            print(
+                f'[xyz-layout] saved full uint32 permutation: {permutation_path} '
+                f'({permutation_size / 1024**2:.3f} MiB)'
+            )
+        for group_name, group_config in groups.items():
+            if not str(group_name).replace('_', '').replace('-', '').isalnum():
+                raise ValueError(f"Unsafe neural group name: {group_name!r}")
+            attributes = list(group_config.get('attributes', []) or [])
+            all_neural_attributes.extend(attributes)
+            neural_config = dict(common_params)
+            neural_config.update(dict(group_config.get('params', {}) or {}))
+            neural_config['attributes'] = attributes
+            group_out = os.path.join(experiment_out_path, str(group_name))
+            os.makedirs(group_out, exist_ok=True)
+            print(
+                f"[dual-neural:{group_name}] compressing "
+                f"{[_attribute_name(item) for item in attributes]}"
+            )
+            group_gaussians = gaussians
+            group_names = [_attribute_name(item) for item in attributes]
+            if '_xyz' in group_names and morton_order is not None:
+                group_gaussians = _clone_gaussians(gaussians)
+                group_gaussians.prune_all_but_these_indices(morton_order)
+                print('[dual-neural:xyz] using Morton layout')
+            else:
+                print(f'[dual-neural:{group_name}] using original SOG/PLAS layout')
+            total_size_bytes += compress_gaussians(
+                group_gaussians, group_out, neural_config
+            )
+
+        neural_names, _ = _validate_hybrid_attributes(all_neural_attributes, [])
+        experiment_config['compressed_attributes'] = neural_names
+        experiment_config['uncompressed_attributes'] = []
+        experiment_config['standalone_decode'] = True
+        experiment_config['max_sh_degree'] = gaussians.max_sh_degree
+        experiment_config['active_sh_degree'] = gaussians.active_sh_degree
+        experiment_config['disable_xyz_log_activation'] = gaussians.disable_xyz_log_activation
+        with open(
+            os.path.join(experiment_out_path, "compression_config.yml"),
+            'w', encoding='utf-8',
+        ) as stream:
+            yaml.safe_dump(experiment_config, stream, sort_keys=False)
+        print(
+            f"[dual-neural] total deployment size: "
+            f"{total_size_bytes / 1024**2:.3f} MiB"
+        )
+        return total_size_bytes
+
     if experiment_config.get('method') == 'neural-texture':
         neural_attributes = list(experiment_config.get('attributes', []))
         sog_attributes = list(experiment_config.get('sog_attributes', []))
@@ -306,6 +521,54 @@ def run_single_decompression(compressed_dir, template_gaussians=None):
     decompressed_gaussians = GaussianModel(experiment_config['max_sh_degree'], experiment_config['disable_xyz_log_activation'])
     decompressed_gaussians.active_sh_degree = experiment_config['active_sh_degree']
 
+    if experiment_config.get('method') == 'dual-neural-texture':
+        groups = dict(experiment_config.get('neural_groups', {}) or {})
+        decoded_names = []
+        common_params = dict(experiment_config.get('params', {}) or {})
+        permutation_name = experiment_config.get('xyz_morton_permutation_file')
+        layout_to_original = None
+        if permutation_name:
+            permutation_path = os.path.join(compressed_dir, permutation_name)
+            if not os.path.isfile(permutation_path):
+                raise FileNotFoundError(
+                    f'Missing XYZ Morton permutation: {permutation_path}'
+                )
+            permutation_np = np.load(permutation_path, allow_pickle=False)
+            if permutation_np.dtype != np.uint32 or permutation_np.ndim != 1:
+                raise ValueError(
+                    'XYZ Morton permutation must be a one-dimensional uint32 array'
+                )
+            layout_to_original = torch.from_numpy(
+                permutation_np.astype(np.int64, copy=False)
+            )
+            print(
+                f'[xyz-layout] loaded full permutation: {permutation_path} '
+                f'({layout_to_original.numel()} entries)'
+            )
+        for group_name, group_config in groups.items():
+            attributes = list(group_config.get('attributes', []) or [])
+            neural_config = dict(common_params)
+            neural_config.update(dict(group_config.get('params', {}) or {}))
+            neural_config['attributes'] = attributes
+            group_dir = os.path.join(compressed_dir, str(group_name))
+            print(f"[dual-neural:{group_name}] decoding {group_dir}")
+            decoded = decompress_gaussians(group_dir, neural_config)
+            for attr_name, decoded_attr in decoded.items():
+                if attr_name in decoded_names:
+                    raise RuntimeError(f"Attribute decoded twice: {attr_name}")
+                if attr_name == '_xyz' and layout_to_original is not None:
+                    decoded_attr = _restore_grid_from_layout(
+                        decoded_attr,
+                        layout_to_original,
+                    )
+                    print('[xyz-layout] restored decoded XYZ to original SOG/PLAS order')
+                decompressed_gaussians.set_attr_from_grid_img(attr_name, decoded_attr)
+                decoded_names.append(attr_name)
+        missing = sorted(set(GAUSSIAN_ATTRIBUTE_NAMES) - set(decoded_names))
+        if missing:
+            raise RuntimeError(f"Dual neural stream is incomplete; missing {missing}")
+        return decompressed_gaussians
+
     if experiment_config.get('method') == 'neural-texture':
         sog_attributes = list(experiment_config.get('sog_attributes', []))
         if sog_attributes:
@@ -363,12 +626,17 @@ def run_roundtrip(gaussians, out_path, experiment_config):
     os.makedirs(experiment_out_path, exist_ok=True)
 
     gaussians.prune_to_square_shape()
+    morton_order = _prepare_morton_block_layout(gaussians, experiment_config)
+    gaussians._xyz_morton_order = morton_order
     
     total_size_bytes = run_single_compression(gaussians, experiment_out_path, experiment_config)
     
     decompressed_gaussians = run_single_decompression(
         experiment_out_path, template_gaussians=gaussians
     )
+
+    for attr_name in GAUSSIAN_ATTRIBUTE_NAMES:
+        _report_roundtrip_quantiles(gaussians, decompressed_gaussians, attr_name)
 
     return decompressed_gaussians, total_size_bytes, experiment_out_path
 
@@ -457,6 +725,13 @@ def compression_exp():
     parser.add_argument("--results_csv", type=str)
     parser.add_argument("--results_tex", type=str)
     parser.add_argument("--disable_lpips", action="store_true")
+    parser.add_argument(
+        "--experiments",
+        type=str,
+        default="",
+        help="Comma-separated experiment names from the compression YAML. "
+             "Empty runs every experiment.",
+    )
     
     cmdlne_string = sys.argv[1:]
     args_cmdline = parser.parse_args(cmdlne_string)
@@ -465,6 +740,23 @@ def compression_exp():
     model_path = args_cmdline.model_path
 
     compr_exp_config = load_config(args_cmdline.compression_config)
+    if args_cmdline.experiments:
+        requested = {
+            name.strip() for name in args_cmdline.experiments.split(",")
+            if name.strip()
+        }
+        available = {
+            experiment["name"] for experiment in compr_exp_config["experiments"]
+        }
+        missing = sorted(requested - available)
+        if missing:
+            raise ValueError(
+                f"Unknown --experiments values {missing}; available={sorted(available)}"
+            )
+        compr_exp_config["experiments"] = [
+            experiment for experiment in compr_exp_config["experiments"]
+            if experiment["name"] in requested
+        ]
 
     training_cfg = get_hydra_training_args(model_path)
 

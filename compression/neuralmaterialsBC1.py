@@ -75,9 +75,39 @@ GAUSSIAN_CHANNELS = (
     ("opacity", 58, 59),
 )
 
+_ACTIVE_ATTRIBUTE_LAYOUT = None
+
+
+def configure_attribute_channels(layout, num_channels: int) -> None:
+    """Install the metadata-defined channel layout for one training run."""
+    global _ACTIVE_ATTRIBUTE_LAYOUT
+    parsed = []
+    for item in layout or []:
+        name = str(item["name"]).lstrip("_")
+        begin, end = int(item["start"]), int(item["end"])
+        if begin < 0 or end <= begin:
+            raise ValueError(f"Invalid channel range for {name}: [{begin}, {end})")
+        parsed.append((name, begin, end))
+    if parsed:
+        covered = [index for _, begin, end in parsed for index in range(begin, end)]
+        if sorted(covered) != list(range(int(num_channels))):
+            raise ValueError(
+                f"Attribute layout does not exactly cover {num_channels} channels: {parsed}"
+            )
+        _ACTIVE_ATTRIBUTE_LAYOUT = tuple(parsed)
+    else:
+        _ACTIVE_ATTRIBUTE_LAYOUT = None
+
 
 def attribute_channels(num_channels: int):
     """Return the semantic channel layout used by the active compression target."""
+    if _ACTIVE_ATTRIBUTE_LAYOUT is not None:
+        if _ACTIVE_ATTRIBUTE_LAYOUT[-1][2] != int(num_channels):
+            raise ValueError(
+                f"Active layout ends at {_ACTIVE_ATTRIBUTE_LAYOUT[-1][2]}, "
+                f"but tensor has {num_channels} channels"
+            )
+        return _ACTIVE_ATTRIBUTE_LAYOUT
     if num_channels == 45:
         return (("features_rest", 0, 45),)
     if num_channels == 59:
@@ -1215,112 +1245,81 @@ def gaussian_attribute_loss(
     channel_balance: torch.Tensor,
     cfg: TrainConfig,
 ) -> torch.Tensor:
-    """Hybrid normalized-domain and render-semantic Gaussian loss."""
-    if pred.shape[-1] == 45 and target.shape[-1] == 45:
-        pred_raw = pred * raw_scale + raw_minimum
-        target_raw = target * raw_scale + raw_minimum
-        balanced_l1 = F.l1_loss(
-            pred * channel_balance,
-            target * channel_balance,
-        )
-        features_rest_mse = F.mse_loss(pred, target)
-        features_rest_variance = (
-            pred.std(dim=0, unbiased=False)
-            - target.std(dim=0, unbiased=False)
-        ).abs().mean()
-        features_rest_energy = (
-            pred.square().mean(dim=0).sqrt()
-            - target.square().mean(dim=0).sqrt()
-        ).abs().mean()
-        raw_l1 = F.smooth_l1_loss(pred_raw, target_raw)
-        return (
-            cfg.features_rest_weight * balanced_l1
-            + cfg.features_rest_mse_weight * features_rest_mse
-            + cfg.features_rest_variance_weight * features_rest_variance
-            + cfg.features_rest_energy_weight * features_rest_energy
-            + raw_l1
-        )
-
-    if pred.shape[-1] != 59 or target.shape[-1] != 59:
-        raise ValueError(
-            "gaussian_attribute_loss expects either 45 SH-rest channels or 59 full Gaussian channels "
-            f"(pred={pred.shape[-1]}, target={target.shape[-1]}). "
-            "Use a metadata-driven channel layout for other attribute sets."
-        )
+    """Metadata-driven loss for SH45 plus any ablated Gaussian attribute."""
+    if pred.shape != target.shape:
+        raise ValueError(f"Prediction/target mismatch: {pred.shape} vs {target.shape}")
+    layout = attribute_channels(pred.shape[-1])
+    slices = {name: (begin, end) for name, begin, end in layout}
     weights = {
-        "xyz": 20.0, "features_dc": 5.0,
+        "xyz": 20.0,
+        "features_dc": 5.0,
         "features_rest": cfg.features_rest_weight,
-        # 以下原始域术语具有最强的缩放/旋转监督。
-        # 此处不要使用普通的组件L1进行旋转：q和-q是等价的，且与仅基于角度的目标冲突。
-        # 旋转在下方通过符号对齐以及显式的范数项进行监督。
-        "scaling": 2.0, "rotation": 0.0, "opacity": 10.0,
+        "scaling": 2.0,
+        # Quaternion components are supervised by the sign-invariant terms below.
+        "rotation": 0.0,
+        "opacity": 10.0,
     }
-    loss = sum(
-        weights[name] * F.l1_loss(
-            pred[:, begin:end] * channel_balance[:, begin:end],
-            target[:, begin:end] * channel_balance[:, begin:end],
-        )
-        for name, begin, end in attribute_channels(pred.shape[-1])
-    )
-
+    loss = pred.new_zeros(())
+    for name, begin, end in layout:
+        weight = float(weights.get(name, 1.0))
+        if weight:
+            loss = loss + weight * F.l1_loss(
+                pred[:, begin:end] * channel_balance[:, begin:end],
+                target[:, begin:end] * channel_balance[:, begin:end],
+            )
     pred_raw = pred * raw_scale + raw_minimum
     target_raw = target * raw_scale + raw_minimum
 
-    # 带额外平方尾部惩罚的全局空间位置监督。
-    xyz_delta = pred_raw[:, 0:3] - target_raw[:, 0:3]
-    xyz_loss = F.smooth_l1_loss(pred_raw[:, 0:3], target_raw[:, 0:3])
-    xyz_tail = xyz_delta.square().mean().sqrt()
+    if "features_rest" in slices:
+        begin, end = slices["features_rest"]
+        pred_rest, target_rest = pred[:, begin:end], target[:, begin:end]
+        loss = loss + cfg.features_rest_mse_weight * F.mse_loss(pred_rest, target_rest)
+        loss = loss + cfg.features_rest_variance_weight * (
+            pred_rest.std(0, unbiased=False) - target_rest.std(0, unbiased=False)
+        ).abs().mean()
+        loss = loss + cfg.features_rest_energy_weight * (
+            pred_rest.square().mean(0).sqrt()
+            - target_rest.square().mean(0).sqrt()
+        ).abs().mean()
 
-    # _scaling 采用对数尺度。同时惩罚对数误差和乘法物理尺度比，同时限制指数以确保梯度稳定。
-    scaling_delta = pred_raw[:, 51:54] - target_raw[:, 51:54]
-    scaling_log_loss = F.smooth_l1_loss(
-        pred_raw[:, 51:54], target_raw[:, 51:54]
-    )
-    scale_ratio = torch.exp(scaling_delta.clamp(-5.0, 5.0))
-    scaling_relative_loss = F.smooth_l1_loss(scale_ratio, torch.ones_like(scale_ratio))
+    if "xyz" in slices:
+        begin, end = slices["xyz"]
+        delta = pred_raw[:, begin:end] - target_raw[:, begin:end]
+        loss = loss + cfg.xyz_raw_weight * (
+            F.smooth_l1_loss(pred_raw[:, begin:end], target_raw[:, begin:end])
+            + 0.1 * delta.square().mean().sqrt()
+        )
 
-    pred_rest, target_rest = pred[:, 6:51], target[:, 6:51]
-    features_rest_mse = F.mse_loss(pred_rest, target_rest)
-    # Direct L1部分：对于相对较小的标准差差距，Smooth-L1 变为二次函数，但在数值上过于薄弱，无法防止方差崩溃。
-    features_rest_variance = (
-        pred_rest.std(dim=0, unbiased=False)
-        - target_rest.std(dim=0, unbiased=False)
-    ).abs().mean()
-    features_rest_energy = (
-        pred_rest.square().mean(dim=0).sqrt()
-        - target_rest.square().mean(dim=0).sqrt()
-    ).abs().mean()
+    if "scaling" in slices:
+        begin, end = slices["scaling"]
+        delta = pred_raw[:, begin:end] - target_raw[:, begin:end]
+        loss = loss + cfg.scaling_raw_weight * F.smooth_l1_loss(
+            pred_raw[:, begin:end], target_raw[:, begin:end]
+        )
+        ratio = torch.exp(delta.clamp(-5.0, 5.0))
+        loss = loss + cfg.scaling_relative_weight * F.smooth_l1_loss(
+            ratio, torch.ones_like(ratio)
+        )
 
-    # q 和 -q 表示相同的旋转。对两边进行归一化，并优化它们的测地角距离，而不是仅使用分量上的 L1 距离。
-    q_pred_raw = pred_raw[:, 54:58]
-    q_target_raw = target_raw[:, 54:58]
-    q_pred = F.normalize(q_pred_raw, dim=1, eps=EPS)
-    q_target = F.normalize(q_target_raw, dim=1, eps=EPS)
-    signed_dot = (q_pred * q_target).sum(dim=1, keepdim=True)
-    # 在比较组件之前，先将预测的符号对齐到目标上。  
-    # detach() 会将这个离散选择排除在梯度图之外。
-    sign = torch.where(signed_dot.detach() < 0.0, -1.0, 1.0)
-    q_pred_aligned = q_pred * sign
-    rotation_aligned = F.smooth_l1_loss(q_pred_aligned, q_target)
-    # 仅Angular损失对|q|不敏感，使得解码器输出能够接近零。保持原始解码的四元数长度接近单位长度。
-    rotation_norm = F.smooth_l1_loss(
-        q_pred_raw.norm(dim=1), torch.ones_like(q_pred_raw[:, 0])
-    )
-    dot = signed_dot.abs().squeeze(1).clamp(0.0, 1.0 - 1e-7)
-    rotation_angle = (2.0 * torch.acos(dot)).mean()
+    if "rotation" in slices:
+        begin, end = slices["rotation"]
+        q_pred_raw, q_target_raw = pred_raw[:, begin:end], target_raw[:, begin:end]
+        q_pred = F.normalize(q_pred_raw, dim=1, eps=EPS)
+        q_target = F.normalize(q_target_raw, dim=1, eps=EPS)
+        signed_dot = (q_pred * q_target).sum(1, keepdim=True)
+        sign = torch.where(signed_dot.detach() < 0.0, -1.0, 1.0)
+        aligned = F.smooth_l1_loss(q_pred * sign, q_target)
+        norm = F.smooth_l1_loss(
+            q_pred_raw.norm(dim=1), torch.ones_like(q_pred_raw[:, 0])
+        )
+        angle = (2.0 * torch.acos(
+            signed_dot.abs().squeeze(1).clamp(0.0, 1.0 - 1e-7)
+        )).mean()
+        loss = loss + cfg.rotation_angle_weight * angle
+        loss = loss + cfg.rotation_aligned_weight * aligned
+        loss = loss + cfg.rotation_norm_weight * norm
 
-    return (
-        loss
-        + cfg.xyz_raw_weight * (xyz_loss + 0.1 * xyz_tail)
-        + cfg.scaling_raw_weight * scaling_log_loss
-        + cfg.scaling_relative_weight * scaling_relative_loss
-        + cfg.features_rest_mse_weight * features_rest_mse
-        + cfg.features_rest_variance_weight * features_rest_variance
-        + cfg.features_rest_energy_weight * features_rest_energy
-        + cfg.rotation_angle_weight * rotation_angle
-        + cfg.rotation_aligned_weight * rotation_aligned
-        + cfg.rotation_norm_weight * rotation_norm
-    )
+    return loss
 
 
 @torch.no_grad()
@@ -1354,9 +1353,14 @@ def debug_fixed_validation(model, ref_base, raw_minimum, raw_scale, cfg, stage: 
     debug_error_quantiles(f"{stage}/normalized", pred, target)
     pred_raw, target_raw = pred * raw_scale + raw_minimum, target * raw_scale + raw_minimum
     debug_error_quantiles(f"{stage}/raw", pred_raw, target_raw)
-    if pred.shape[1] >= 58:
-        q_pred = F.normalize(pred_raw[:, 54:58], dim=1, eps=EPS)
-        q_target = F.normalize(target_raw[:, 54:58], dim=1, eps=EPS)
+    rotation_range = {
+        name: (begin, end)
+        for name, begin, end in attribute_channels(pred.shape[1])
+    }.get("rotation")
+    if rotation_range is not None:
+        begin, end = rotation_range
+        q_pred = F.normalize(pred_raw[:, begin:end], dim=1, eps=EPS)
+        q_target = F.normalize(target_raw[:, begin:end], dim=1, eps=EPS)
         angle = 2.0 * torch.acos((q_pred * q_target).sum(1).abs().clamp(0, 1 - 1e-7))
         aq = torch.quantile(angle * (180.0 / math.pi), angle.new_tensor([.5, .95, .99, .999]))
         print(f"[rotation-angle:{stage}] p50={aq[0].item():.3f}deg p95={aq[1].item():.3f}deg "
@@ -1401,8 +1405,16 @@ def full_grid_validation(
         name: torch.empty(total, dtype=torch.float32)
         for name, begin, end in attribute_channels(channels)
     }
+    semantic_slices = {
+        name: (begin, end) for name, begin, end in attribute_channels(channels)
+    }
+    rotation_range = semantic_slices.get("rotation")
+    opacity_range = semantic_slices.get("opacity")
     pixel_errors = torch.empty(total, dtype=torch.float32)
-    rotation_angles = torch.empty(total, dtype=torch.float32) if channels >= 58 else None
+    rotation_angles = (
+        torch.empty(total, dtype=torch.float32)
+        if rotation_range is not None else None
+    )
     pred_sum = torch.zeros(channels, dtype=torch.float64)
     pred_sq_sum = torch.zeros(channels, dtype=torch.float64)
     target_sum = torch.zeros(channels, dtype=torch.float64)
@@ -1437,9 +1449,11 @@ def full_grid_validation(
             err = (pred_raw[:, attr_begin:attr_end] - target_raw[:, attr_begin:attr_end])
             attr_errors[name][begin_index:end_index] = err.square().mean(1).sqrt().cpu()
 
-        if channels >= 58:
-            qp = F.normalize(pred_raw[:, 54:58], dim=1, eps=EPS)
-            qt = F.normalize(target_raw[:, 54:58], dim=1, eps=EPS)
+        angle = None
+        if rotation_range is not None:
+            rot_begin, rot_end = rotation_range
+            qp = F.normalize(pred_raw[:, rot_begin:rot_end], dim=1, eps=EPS)
+            qt = F.normalize(target_raw[:, rot_begin:rot_end], dim=1, eps=EPS)
             angle = 2.0 * torch.acos((qp * qt).sum(1).abs().clamp(0, 1 - 1e-7))
             rotation_angles[begin_index:end_index] = (angle * 180.0 / math.pi).cpu()
             # q 和 -q 编码相同的旋转。
@@ -1447,7 +1461,10 @@ def full_grid_validation(
             q_mse = torch.minimum(
                 (qp - qt).square().mean(1), (qp + qt).square().mean(1)
             )
-            semantic_sq_sum = sq.sum(1) - sq[:, 54:58].sum(1) + 4.0 * q_mse
+            semantic_sq_sum = (
+                sq.sum(1) - sq[:, rot_begin:rot_end].sum(1)
+                + float(rot_end - rot_begin) * q_mse
+            )
         else:
             semantic_sq_sum = sq.sum(1)
         per_pixel = semantic_sq_sum / channels
@@ -1458,18 +1475,23 @@ def full_grid_validation(
             tile_ids, weights=per_pixel.double().cpu(), minlength=tile_sse.numel()
         )
         tile_count += torch.bincount(tile_ids, minlength=tile_count.numel())
-        if cfg.full_validation_opacity_weighted and channels >= 59:
-            visibility = torch.sigmoid(target_raw[:, 58]).double()
+        if cfg.full_validation_opacity_weighted and opacity_range is not None:
+            opacity_begin, _ = opacity_range
+            visibility = torch.sigmoid(target_raw[:, opacity_begin]).double()
             weighted_den += float(visibility.sum().item())
-            weighted_sse["xyz"] += float(
-                (visibility * (pred_raw[:, 0:3] - target_raw[:, 0:3]).square().mean(1).double()).sum().item()
-            )
-            weighted_sse["scaling"] += float(
-                (visibility * (pred_raw[:, 51:54] - target_raw[:, 51:54]).square().mean(1).double()).sum().item()
-            )
-            weighted_sse["rotation"] += float(
-                (visibility * angle.double().square()).sum().item()
-            )
+            for weighted_name in ("xyz", "scaling"):
+                if weighted_name in semantic_slices:
+                    attr_begin, attr_end = semantic_slices[weighted_name]
+                    weighted_sse[weighted_name] += float(
+                        (visibility * (
+                            pred_raw[:, attr_begin:attr_end]
+                            - target_raw[:, attr_begin:attr_end]
+                        ).square().mean(1).double()).sum().item()
+                    )
+            if angle is not None:
+                weighted_sse["rotation"] += float(
+                    (visibility * angle.double().square()).sum().item()
+                )
 
     global_mse = total_sse / max(total * channels, 1)
     global_rmse = math.sqrt(global_mse)
@@ -1512,11 +1534,17 @@ def full_grid_validation(
         ratio = pred_var[attr_begin:attr_end].sqrt().mean() / target_var[attr_begin:attr_end].sqrt().mean().clamp_min(1e-12)
         print(f"[full-std-ratio:{stage}/{name}] pred_over_target={ratio.item():.6g}")
     if weighted_den > 0.0:
-        print(
-            f"[full-opacity-weighted:{stage}] xyz_rmse={math.sqrt(weighted_sse['xyz']/weighted_den):.7g} "
-            f"scaling_rmse={math.sqrt(weighted_sse['scaling']/weighted_den):.7g} "
-            f"rotation_rms={math.sqrt(weighted_sse['rotation']/weighted_den)*180/math.pi:.3f}deg"
-        )
+        fields = []
+        if "xyz" in semantic_slices:
+            fields.append(f"xyz_rmse={math.sqrt(weighted_sse['xyz']/weighted_den):.7g}")
+        if "scaling" in semantic_slices:
+            fields.append(f"scaling_rmse={math.sqrt(weighted_sse['scaling']/weighted_den):.7g}")
+        if rotation_range is not None:
+            fields.append(
+                f"rotation_rms={math.sqrt(weighted_sse['rotation']/weighted_den)*180/math.pi:.3f}deg"
+            )
+        if fields:
+            print(f"[full-opacity-weighted:{stage}] " + " ".join(fields))
     if was_training:
         model.train()
     return {"score": score, "mse": global_mse, "rmse": global_rmse, "psnr": global_psnr}
@@ -1540,8 +1568,13 @@ def debug_training_stage(model, uv, lod, target, pred, stage: str) -> None:
     debug_tensor(f"{stage}/decoder_input", decoder_input)
     debug_compare(f"{stage}/forward_vs_decoder_raw", pred, decoder_raw)
     debug_gaussian_batch(f"{stage}/decoder_output", pred, target)
-    if pred.shape[1] >= 51:
-        pr, tr = pred[:, 6:51], target[:, 6:51]
+    features_rest_range = {
+        name: (begin, end)
+        for name, begin, end in attribute_channels(pred.shape[1])
+    }.get("features_rest")
+    if features_rest_range is not None:
+        begin, end = features_rest_range
+        pr, tr = pred[:, begin:end], target[:, begin:end]
         mse = F.mse_loss(pr, tr)
         std_l1 = (pr.std(0, unbiased=False) - tr.std(0, unbiased=False)).abs().mean()
         energy_l1 = (
@@ -1605,18 +1638,11 @@ def train(model: NeuralMaterialCompressionModel, ref_mips: List[torch.Tensor], c
     channel_mean = torch.zeros(C, 1, 1, device=device)
     channel_std = torch.ones(C, 1, 1, device=device)
 
-    # 只对 Albedo（前三个通道，索引 0,1,2）计算真实的 mean/std
-    for i in range(1,4):
-        mean_i = ref_base[i].mean()
-        std_i = ref_base[i].std() + 1e-8
-        std_i = torch.clamp(std_i, min=0.1)  # 防止数值爆炸
-        channel_mean[i, 0, 0] = mean_i
-        channel_std[i, 0, 0] = std_i
-
-    # print("channel_mean:", channel_mean)
-    # print("channel_std:", channel_std)
-    ref_mips_norm = [(mip - channel_mean) / channel_std for mip in ref_mips]
-    # 覆盖材料特定的反照率变换：高斯属性已由 compression/neural_texture.py 独立归一化。
+    # The original material-texture implementation applied an Albedo-specific
+    # transform to channels 1..3. Gaussian streams can contain only XYZ (C=3)
+    # or arbitrary metadata-defined channel groups, so fixed Albedo indices are
+    # invalid. Every Gaussian attribute has already been normalized independently
+    # by compression/neural_texture.py; keep this transform as identity.
     channel_mean.zero_()
     channel_std.fill_(1.0)
     ref_mips_norm = ref_mips
@@ -1842,6 +1868,9 @@ def train_from_tensor(reference: torch.Tensor, export_dir: Path, config=None):
     reference = reference.detach().float().to(device)
     if reference.ndim != 3 or reference.shape[1] != reference.shape[2]:
         raise ValueError(f"Expected square [C,H,W] reference, got {tuple(reference.shape)}")
+    configure_attribute_channels(
+        config.get("attribute_channel_layout", []), int(reference.shape[0])
+    )
 
     ref_levels = int(config.get("ref_mips", int(math.log2(reference.shape[-1])) + 1))
     ref_mips = build_mip_chain(reference, ref_levels)

@@ -230,6 +230,7 @@ def _runtime_artifact_size(path: Path) -> int:
     names = {
         "decoder_fp16.bin", "metadata.json", "gaussian_layout.json",
         "tail_residuals.npz", "prediction_corrections.npz",
+        "xyz_block_metadata.npz",
         "decoder_features_rest_fp16.bin", "decoder_scaling_fp16.bin",
     }
     files = [p for p in path.iterdir() if p.is_file() and (p.name in names or p.name.endswith(".bc1.dds"))]
@@ -321,6 +322,87 @@ def _save_prediction_error_corrections(
         model.train()
 
 
+def _xyz_to_block_offsets(chw: torch.Tensor, tile_size: int, out_dir: Path):
+    """Convert Morton-tiled physical XYZ [3,H,W] to local [0,1] offsets."""
+    channels, height, width = chw.shape
+    if channels != 3 or height != width or height % tile_size != 0:
+        raise ValueError(
+            f"XYZ block transform expects [3,S,S] with S divisible by "
+            f"{tile_size}, got {tuple(chw.shape)}"
+        )
+    tiles_y, tiles_x = height // tile_size, width // tile_size
+    blocks = (
+        chw.permute(1, 2, 0)
+        .reshape(tiles_y, tile_size, tiles_x, tile_size, 3)
+        .permute(0, 2, 1, 3, 4)
+        .contiguous()
+        .reshape(tiles_y * tiles_x, tile_size * tile_size, 3)
+    )
+    block_min = blocks.amin(dim=1)
+    block_max = blocks.amax(dim=1)
+    block_scale = (block_max - block_min).clamp_min(1e-8)
+    offsets = ((blocks - block_min[:, None, :]) / block_scale[:, None, :]).clamp(0, 1)
+    offset_chw = (
+        offsets.reshape(tiles_y, tiles_x, tile_size, tile_size, 3)
+        .permute(0, 2, 1, 3, 4)
+        .contiguous()
+        .reshape(height, width, 3)
+        .permute(2, 0, 1)
+        .contiguous()
+    )
+    metadata_dtype = np.float32
+    metadata_file = "xyz_block_metadata.npz"
+    np.savez_compressed(
+        out_dir / metadata_file,
+        block_min=block_min.numpy().astype(metadata_dtype),
+        block_scale=block_scale.numpy().astype(metadata_dtype),
+    )
+    print(
+        f"[xyz-block] blocks={blocks.shape[0]} tile={tile_size}x{tile_size} "
+        f"metadata={(out_dir / metadata_file).stat().st_size / 1024**2:.3f} MiB "
+        f"physical_scale_p50={torch.quantile(block_scale, 0.5).item():.7g} "
+        f"physical_scale_p95={torch.quantile(block_scale, 0.95).item():.7g} "
+        f"physical_scale_max={block_scale.max().item():.7g}"
+    )
+    return offset_chw, {
+        "type": "xyz_block_offset_v1",
+        "tile_size": int(tile_size),
+        "tiles_y": int(tiles_y),
+        "tiles_x": int(tiles_x),
+        "metadata_file": metadata_file,
+        "metadata_dtype": "float32",
+    }
+
+
+def _xyz_from_block_offsets(
+    offset_chw: torch.Tensor, transform: Dict[str, Any], out_dir: Path
+) -> torch.Tensor:
+    """Restore physical XYZ from decoded local offsets and block metadata."""
+    tile_size = int(transform["tile_size"])
+    tiles_y, tiles_x = int(transform["tiles_y"]), int(transform["tiles_x"])
+    height, width = tiles_y * tile_size, tiles_x * tile_size
+    archive = np.load(out_dir / transform["metadata_file"], allow_pickle=False)
+    block_min = torch.from_numpy(archive["block_min"].astype(np.float32, copy=False))
+    block_scale = torch.from_numpy(archive["block_scale"].astype(np.float32, copy=False))
+    archive.close()
+    blocks = (
+        offset_chw.permute(1, 2, 0)
+        .reshape(tiles_y, tile_size, tiles_x, tile_size, 3)
+        .permute(0, 2, 1, 3, 4)
+        .contiguous()
+        .reshape(tiles_y * tiles_x, tile_size * tile_size, 3)
+    )
+    physical = blocks * block_scale[:, None, :] + block_min[:, None, :]
+    return (
+        physical.reshape(tiles_y, tiles_x, tile_size, tile_size, 3)
+        .permute(0, 2, 1, 3, 4)
+        .contiguous()
+        .reshape(height, width, 3)
+        .permute(2, 0, 1)
+        .contiguous()
+    )
+
+
 def compress_gaussians(gaussians, out_dir: str | os.PathLike, config=None) -> int:
     config = dict(config or {})
     out_dir = Path(out_dir)
@@ -346,6 +428,13 @@ def compress_gaussians(gaussians, out_dir: str | os.PathLike, config=None) -> in
         grid = gaussians.attr_as_grid_img(name)
         height, width = int(grid.shape[0]), int(grid.shape[1])
         chw = grid.reshape(height, width, -1).permute(2, 0, 1).detach().float().cpu()
+        physical_chw = chw
+        spatial_transform = None
+        if name == "_xyz" and bool(config.get("xyz_block_local_normalization", False)):
+            chw, spatial_transform = _xyz_to_block_offsets(
+                chw, int(config.get("xyz_block_size", 16)), out_dir
+            )
+            _stats("xyz_block_offset", chw)
         if name == "_rotation" and bool(config.get("canonicalize_rotation_sign", True)):
             chw = _canonicalize_quaternion_chw(chw)
             print("[rotation] canonicalized q/-q sign using the largest-magnitude component")
@@ -383,7 +472,7 @@ def compress_gaussians(gaussians, out_dir: str | os.PathLike, config=None) -> in
             f"ratio={tail_indices.numel() / max(chw.numel(), 1):.6%} "
             f"residual_dtype={tail_dtype_name}"
         )
-        debug_original_grids[name] = chw
+        debug_original_grids[name] = physical_chw
 
         channels = int(chw.shape[0])
         layout[name] = {
@@ -398,8 +487,23 @@ def compress_gaussians(gaussians, out_dir: str | os.PathLike, config=None) -> in
             "tail_residual_dtype": tail_dtype_name,
             "tail_storage": "absolute_values_v1",
         }
+        if spatial_transform is not None:
+            layout[name]["spatial_transform"] = spatial_transform
         channel_offset += channels
         normalised_images.append(normalised)
+
+    # XYZ-only streams still need opacity as an auxiliary importance signal for
+    # selecting sparse post-quantization corrections. It is not appended to the
+    # neural reference, layout, decoder output, or XYZ stream size.
+    selected_names = set(_attribute_names(config))
+    if "_xyz" in selected_names and "_opacity" not in selected_names:
+        opacity_grid = gaussians.attr_as_grid_img("_opacity")
+        opacity_height, opacity_width = opacity_grid.shape[:2]
+        debug_original_grids["_opacity"] = (
+            opacity_grid.reshape(opacity_height, opacity_width, -1)
+            .permute(2, 0, 1)
+            .detach().float().cpu()
+        )
 
     if not normalised_images:
         raise ValueError("Neural texture compression needs at least one attribute.")
@@ -472,6 +576,14 @@ def compress_gaussians(gaussians, out_dir: str | os.PathLike, config=None) -> in
         channel_scale.extend(info["scale"])
     config["channel_minimum"] = channel_minimum
     config["channel_scale"] = channel_scale
+    config["attribute_channel_layout"] = [
+        {
+            "name": name,
+            "start": int(info["start"]),
+            "end": int(info["end"]),
+        }
+        for name, info in layout.items()
+    ]
 
     # 训练神经纹理模型
     model, _history = train_from_tensor(
@@ -862,6 +974,17 @@ def decompress_gaussians(out_dir: str | os.PathLike, config=None) -> Dict[str, n
             value.reshape(value.shape[0], -1)[:, indices] = vectors.T
             print(
                 f"[prediction-correction:{name}] overwritten={indices.numel()} vectors"
+            )
+        spatial_transform = info.get("spatial_transform")
+        if spatial_transform is not None:
+            if name != "_xyz" or spatial_transform.get("type") != "xyz_block_offset_v1":
+                raise ValueError(
+                    f"Unsupported spatial transform for {name}: {spatial_transform}"
+                )
+            value = _xyz_from_block_offsets(value, spatial_transform, out_dir)
+            print(
+                f"[xyz-block] restored physical XYZ from "
+                f"{spatial_transform['tile_size']}x{spatial_transform['tile_size']} offsets"
             )
         _stats(f"denormalization/{name}", value)
         if debug_original_grids is not None and name in debug_original_grids:
